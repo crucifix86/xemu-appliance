@@ -10,6 +10,17 @@ Standalone Xbox emulator appliance - boots directly into xemu, no desktop enviro
 - Vulkan renderer option for Intel GPU compatibility
 - NevolutionX/XBMC dashboard support
 
+## Download
+
+Pre-built image (8.5GB compressed):
+https://www.mediafire.com/file_premium/elwe6sgs6mnpl8w/xemu-appliance-working.img.tar.gz/file
+
+Extract and write to USB:
+```bash
+tar -xzf xemu-appliance-working.img.tar.gz
+sudo dd if=xemu-appliance-working.img of=/dev/sdX bs=4M status=progress
+```
+
 ## Boot Menu Options
 
 1. **Debian GNU/Linux** - Default boot, OpenGL renderer
