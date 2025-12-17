@@ -1,0 +1,8 @@
+# Root filesystem
+LABEL=XEMU_ROOT / ext4 defaults,rw 0 1
+
+# EFI
+UUID=5AFC-AA86 /boot/efi vfat defaults 0 2
+
+# Temp
+tmpfs /tmp tmpfs defaults,nosuid,nodev,mode=1777 0 0
