@@ -1,0 +1,4 @@
+eeprom.bin
+*.img
+*.qcow2
+*.bin

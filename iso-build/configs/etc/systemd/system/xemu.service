@@ -1,0 +1,13 @@
+[Unit]
+Description=xemu Xbox Emulator
+After=network.target xbox-network.service
+Wants=xbox-network.service
+
+[Service]
+Type=simple
+User=xbox
+ExecStart=/opt/xbox/start-xemu.sh
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

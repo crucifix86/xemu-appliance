@@ -1,0 +1,15 @@
+#!/bin/sh
+exec tail -n +3 $0
+# This file provides an easy way to add custom menu entries.  Simply type the
+# menu entries you want to add after this comment.  Be careful not to change
+# the 'exec tail' line above.
+
+menuentry "Install to Disk" {
+    linux /boot/vmlinuz-6.12.57+deb13-amd64 root=UUID=0bbe2d2e-1ba5-4e76-8857-e34d06a30d36 ro quiet installer
+    initrd /boot/initrd.img-6.12.57+deb13-amd64
+}
+
+menuentry "xemu (Vulkan Renderer)" {
+    linux /boot/vmlinuz-6.12.57+deb13-amd64 root=UUID=0bbe2d2e-1ba5-4e76-8857-e34d06a30d36 ro quiet vulkan
+    initrd /boot/initrd.img-6.12.57+deb13-amd64
+}

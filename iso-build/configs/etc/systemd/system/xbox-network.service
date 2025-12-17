@@ -1,0 +1,11 @@
+[Unit]
+Description=Xbox TAP Network Setup
+Before=dnsmasq.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/xbox/setup-network.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

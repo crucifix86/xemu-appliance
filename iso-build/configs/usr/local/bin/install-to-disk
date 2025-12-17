@@ -1,0 +1,220 @@
+#!/bin/bash
+# xemu Appliance Graphical Installer
+
+export NEWT_COLORS='
+root=,blue
+window=,black
+border=white,black
+textbox=white,black
+button=black,white
+'
+
+TITLE="xemu Appliance Installer"
+LOGFILE="/tmp/installer.log"
+echo "=== Installer started $(date) ===" > "$LOGFILE"
+
+error_exit() {
+    whiptail --title "Error" --msgbox "$1\n\nCheck $LOGFILE for details." 12 50
+    exit 1
+}
+
+log() {
+    echo "[$(date +%H:%M:%S)] $1" >> "$LOGFILE"
+}
+
+# Must be root
+if [ "$EUID" -ne 0 ]; then
+    error_exit "Please run as root"
+fi
+
+# Welcome screen
+whiptail --title "$TITLE" --yesno "Welcome to the xemu Appliance Installer.\n\nThis will install the xemu appliance to your internal disk.\n\nContinue?" 12 50 || exit 0
+
+# Find boot device
+BOOT_DEV=$(findmnt -n -o SOURCE / | sed 's/[0-9]*$//' | sed 's/p$//')
+log "Boot device: $BOOT_DEV"
+
+# Build drive list for menu
+MENU_OPTIONS=()
+while IFS= read -r line; do
+    DEV="/dev/$(echo "$line" | awk '{print $1}')"
+    if [[ "$DEV" != "$BOOT_DEV"* ]] && [[ "$DEV" != *"loop"* ]]; then
+        SIZE=$(echo "$line" | awk '{print $2}')
+        MODEL=$(echo "$line" | awk '{$1=$2=""; print $0}' | xargs)
+        [ -z "$MODEL" ] && MODEL="Unknown"
+        MENU_OPTIONS+=("$DEV" "$SIZE - $MODEL")
+    fi
+done < <(lsblk -d -n -o NAME,SIZE,MODEL | grep -v loop)
+
+if [ ${#MENU_OPTIONS[@]} -eq 0 ]; then
+    error_exit "No suitable target drives found!"
+fi
+
+# Drive selection
+TARGET=$(whiptail --title "$TITLE" --menu "Select target drive:\n\n(Boot drive $BOOT_DEV excluded)" 18 60 6 "${MENU_OPTIONS[@]}" 3>&1 1>&2 2>&3) || exit 0
+log "Target device: $TARGET"
+
+# Get drive info for confirmation
+DRIVE_INFO=$(lsblk -d -n -o SIZE,MODEL "$TARGET" | xargs)
+
+# Final confirmation
+whiptail --title "$TITLE" --yesno "WARNING: ALL DATA WILL BE ERASED!\n\nTarget: $TARGET\nInfo: $DRIVE_INFO\n\nAre you absolutely sure?" 12 50 || exit 0
+
+whiptail --title "$TITLE" --yesno "FINAL WARNING!\n\nThis is your last chance to cancel.\n\nProceed with installation?" 10 50 || exit 0
+
+# Installation progress
+{
+    echo 5
+    echo "XXX"
+    echo "Unmounting existing partitions..."
+    echo "XXX"
+    umount ${TARGET}* 2>/dev/null || true
+    sleep 1
+    
+    echo 10
+    echo "XXX"
+    echo "Creating partition table..."
+    echo "XXX"
+    log "Creating partitions on $TARGET"
+    sgdisk -Z "$TARGET" >> "$LOGFILE" 2>&1 || true
+    sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$TARGET" >> "$LOGFILE" 2>&1
+    sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "$TARGET" >> "$LOGFILE" 2>&1
+    partprobe "$TARGET"
+    sleep 2
+    
+    # Determine partition names
+    if [[ "$TARGET" == *"nvme"* ]] || [[ "$TARGET" == *"mmcblk"* ]]; then
+        PART1="${TARGET}p1"
+        PART2="${TARGET}p2"
+    else
+        PART1="${TARGET}1"
+        PART2="${TARGET}2"
+    fi
+    log "EFI partition: $PART1"
+    log "Root partition: $PART2"
+    
+    echo 20
+    echo "XXX"
+    echo "Formatting EFI partition..."
+    echo "XXX"
+    mkfs.fat -F 32 "$PART1" >> "$LOGFILE" 2>&1
+    
+    echo 25
+    echo "XXX"
+    echo "Formatting root partition..."
+    echo "XXX"
+    mkfs.ext4 -F "$PART2" >> "$LOGFILE" 2>&1
+    
+    echo 30
+    echo "XXX"
+    echo "Mounting target..."
+    echo "XXX"
+    mkdir -p /mnt/target
+    mount "$PART2" /mnt/target
+    mkdir -p /mnt/target/boot/efi
+    mount "$PART1" /mnt/target/boot/efi
+    
+    echo 35
+    echo "XXX"
+    echo "Copying system files (please wait)..."
+    echo "XXX"
+    log "Starting rsync..."
+    rsync -aHAX \
+        --exclude='/mnt/*' \
+        --exclude='/proc/*' \
+        --exclude='/sys/*' \
+        --exclude='/dev/*' \
+        --exclude='/run/*' \
+        --exclude='/tmp/*' \
+        --exclude='/boot/efi/*' \
+        / /mnt/target/ 2>> "$LOGFILE"
+    log "rsync complete"
+    
+    # Fix permissions for xbox files
+    chmod -R 755 /mnt/target/opt/xbox/
+    chmod 666 /mnt/target/opt/xbox/xbox_hdd.qcow2
+    chmod 666 /mnt/target/opt/xbox/eeprom.bin
+    chown -R 1000:1000 /mnt/target/opt/xbox/
+    log "Fixed /opt/xbox permissions"
+    
+    echo 75
+    echo "XXX"
+    echo "Creating directories..."
+    echo "XXX"
+    mkdir -p /mnt/target/{proc,sys,dev,run,tmp,mnt}
+    chmod 1777 /mnt/target/tmp
+    
+    echo 78
+    echo "XXX"
+    echo "Configuring system..."
+    echo "XXX"
+    EFI_UUID=$(blkid -s UUID -o value "$PART1")
+    ROOT_UUID=$(blkid -s UUID -o value "$PART2")
+    log "EFI UUID: $EFI_UUID"
+    log "Root UUID: $ROOT_UUID"
+    
+    cat > /mnt/target/etc/fstab << FSTAB
+UUID=$ROOT_UUID / ext4 defaults,rw 0 1
+UUID=$EFI_UUID /boot/efi vfat defaults 0 2
+tmpfs /tmp tmpfs defaults,nosuid,nodev,mode=1777 0 0
+FSTAB
+    
+    # Remove installer kernel param from grub default
+    sed -i 's/ installer//' /mnt/target/etc/default/grub
+    
+    echo 82
+    echo "XXX"
+    echo "Mounting for chroot..."
+    echo "XXX"
+    mount --bind /dev /mnt/target/dev
+    mount --bind /proc /mnt/target/proc
+    mount --bind /sys /mnt/target/sys
+    mount --bind /sys/firmware/efi/efivars /mnt/target/sys/firmware/efi/efivars 2>/dev/null || true
+    
+    echo 85
+    echo "XXX"
+    echo "Installing bootloader..."
+    echo "XXX"
+    log "Installing GRUB..."
+    chroot /mnt/target grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=XEMU --removable --recheck >> "$LOGFILE" 2>&1
+    GRUB_EXIT=$?
+    log "grub-install exit code: $GRUB_EXIT"
+    
+    echo 90
+    echo "XXX"
+    echo "Generating boot configuration..."
+    echo "XXX"
+    chroot /mnt/target update-grub >> "$LOGFILE" 2>&1
+    log "update-grub complete"
+    
+    # Verify EFI files exist
+    log "EFI contents:"
+    ls -la /mnt/target/boot/efi/EFI/BOOT/ >> "$LOGFILE" 2>&1
+    
+    echo 95
+    echo "XXX"
+    echo "Cleaning up..."
+    echo "XXX"
+    sync
+    umount /mnt/target/sys/firmware/efi/efivars 2>/dev/null || true
+    umount /mnt/target/sys /mnt/target/proc /mnt/target/dev 2>/dev/null
+    umount /mnt/target/boot/efi 2>/dev/null
+    umount /mnt/target 2>/dev/null
+    
+    echo 100
+    echo "XXX"
+    echo "Installation complete!"
+    echo "XXX"
+    sleep 1
+    
+} | whiptail --title "$TITLE" --gauge "Starting installation..." 8 60 0
+
+log "Installation finished"
+
+# Success
+whiptail --title "$TITLE" --msgbox "Installation Complete!\n\nRemove the USB drive and press OK to reboot.\n\n(System will power off - turn it back on manually)" 12 50
+
+# Force sync and power off (more reliable than reboot in this context)
+sync
+sleep 1
+echo o > /proc/sysrq-trigger 2>/dev/null || systemctl poweroff -f || poweroff -f

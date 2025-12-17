@@ -1,0 +1,14 @@
+[general]
+show_welcome = false
+
+[display]
+renderer = 'VULKAN'
+
+[sys.files]
+bootrom_path = '/opt/xbox/bios/mcpx_1.0.bin'
+flashrom_path = '/opt/xbox/bios/Complex_4627.bin'
+eeprom_path = '/opt/xbox/eeprom.bin'
+hdd_path = '/opt/xbox/xbox_hdd.qcow2'
+
+[net]
+enable = false
