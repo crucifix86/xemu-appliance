@@ -89,20 +89,23 @@ sudo dnsmasq --interface=tap0 --dhcp-range=192.168.100.10,192.168.100.50,12h --b
 
 1. **Create minimal rootfs with debootstrap**
    ```bash
-   sudo debootstrap --variant=minbase bookworm /mnt/xemu-rootfs
+   sudo debootstrap --variant=minbase trixie /mnt/xemu-rootfs
    ```
+   Note: Must use Trixie (not bookworm) - xemu requires glibc 2.38+
 
 2. **Install required packages**
    ```bash
    chroot /mnt/xemu-rootfs apt install \
      linux-image-amd64 \
-     xorg \
-     mesa-utils \
+     xorg xserver-xorg-input-evdev \
+     mesa-utils libgl1-mesa-dri \
      libsdl2-2.0-0 \
-     pulseaudio \
+     pulseaudio libasound2 \
      dnsmasq \
-     iproute2 \
-     iptables
+     iproute2 iptables \
+     libslirp0 libgtk-3-0 libepoxy0 libpcap0.8 \
+     libcurl4 libsamplerate0 xxhash \
+     rsync parted dosfstools e2fsprogs
    ```
 
 3. **Copy xemu and Xbox files**
