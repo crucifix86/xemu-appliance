@@ -89,7 +89,7 @@ The installer creates 3 partitions:
 
 - Xbox gets DHCP from appliance (192.168.100.x range)
 - FTP: Connect to Xbox IP, credentials `xbox/xbox`
-- Dashboard handles all network config
+- XBMC (Xbox Media Center) handles all network config
 
 ## Building from Source
 
@@ -111,7 +111,7 @@ The installer creates 3 partitions:
 | File | Description |
 |------|-------------|
 | `iso-build/configs/` | System configuration files |
-| `xemu-unleashx-integration-plan.md` | Detailed project documentation |
+| `xemu-xbmc-integration-plan.md` | Detailed project documentation |
 | `PERFORMANCE_RESEARCH.md` | Performance testing notes |
 
 ## License
