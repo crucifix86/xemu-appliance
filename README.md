@@ -70,6 +70,7 @@ The installer creates 3 partitions:
 | CPU | GPU | Status |
 |-----|-----|--------|
 | Intel Pentium J4205 | HD Graphics 505 | Works (slow but playable) |
+| AMD Ryzen 3 2200G | Vega 8 | Planned (should be excellent) |
 
 ### Known Issues
 
