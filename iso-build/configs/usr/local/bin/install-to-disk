@@ -78,20 +78,24 @@ whiptail --title "$TITLE" --yesno "FINAL WARNING!\n\nThis is your last chance to
     log "Creating partitions on $TARGET"
     sgdisk -Z "$TARGET" >> "$LOGFILE" 2>&1 || true
     sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$TARGET" >> "$LOGFILE" 2>&1
-    sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "$TARGET" >> "$LOGFILE" 2>&1
+    sgdisk -n 2:0:+10G -t 2:8300 -c 2:"ROOT" "$TARGET" >> "$LOGFILE" 2>&1
+    sgdisk -n 3:0:0 -t 3:8300 -c 3:"XBOX_HDD" "$TARGET" >> "$LOGFILE" 2>&1
     partprobe "$TARGET"
     sleep 2
-    
+
     # Determine partition names
     if [[ "$TARGET" == *"nvme"* ]] || [[ "$TARGET" == *"mmcblk"* ]]; then
         PART1="${TARGET}p1"
         PART2="${TARGET}p2"
+        PART3="${TARGET}p3"
     else
         PART1="${TARGET}1"
         PART2="${TARGET}2"
+        PART3="${TARGET}3"
     fi
     log "EFI partition: $PART1"
     log "Root partition: $PART2"
+    log "Xbox HDD partition: $PART3"
     
     echo 20
     echo "XXX"
@@ -104,7 +108,15 @@ whiptail --title "$TITLE" --yesno "FINAL WARNING!\n\nThis is your last chance to
     echo "Formatting root partition..."
     echo "XXX"
     mkfs.ext4 -F "$PART2" >> "$LOGFILE" 2>&1
-    
+
+    echo 28
+    echo "XXX"
+    echo "Writing Xbox HDD to partition (please wait)..."
+    echo "XXX"
+    log "Writing raw Xbox HDD to $PART3"
+    dd if=/opt/xbox/xbox_hdd.raw of="$PART3" bs=4M status=none 2>> "$LOGFILE"
+    log "Xbox HDD write complete"
+
     echo 30
     echo "XXX"
     echo "Mounting target..."
@@ -127,15 +139,23 @@ whiptail --title "$TITLE" --yesno "FINAL WARNING!\n\nThis is your last chance to
         --exclude='/run/*' \
         --exclude='/tmp/*' \
         --exclude='/boot/efi/*' \
+        --exclude='/opt/xbox/xbox_hdd.qcow2' \
+        --exclude='/opt/xbox/xbox_hdd.raw' \
         / /mnt/target/ 2>> "$LOGFILE"
     log "rsync complete"
+
+    # Update xemu.toml to use raw partition
+    log "Updating xemu.toml to use $PART3"
+    sed -i "s|hdd_path = .*|hdd_path = \"$PART3\"|" /mnt/target/home/xbox/.local/share/xemu/xemu/xemu.toml
+    log "xemu.toml updated"
     
     # Fix permissions for xbox files
     chmod -R 755 /mnt/target/opt/xbox/
-    chmod 666 /mnt/target/opt/xbox/xbox_hdd.qcow2
     chmod 666 /mnt/target/opt/xbox/eeprom.bin
     chown -R 1000:1000 /mnt/target/opt/xbox/
-    log "Fixed /opt/xbox permissions"
+    # Add xbox user to disk group for raw partition access
+    chroot /mnt/target usermod -aG disk xbox 2>/dev/null || true
+    log "Fixed /opt/xbox permissions, added xbox to disk group"
     
     echo 75
     echo "XXX"
