@@ -425,11 +425,21 @@ These were tried and made things WORSE:
 
 ---
 
+## Xbox HDD Storage
+
+| Mode | Storage | Path | Notes |
+|------|---------|------|-------|
+| USB Boot (testing) | qcow2 | `/opt/xbox/xbox_hdd.qcow2` | Compressed, portable |
+| Installed to disk | Raw partition | `/dev/sdX3` | Direct block I/O, better performance |
+
+The installer writes the raw Xbox HDD image directly to partition 3, then updates xemu.toml to use the raw partition path. USB boot is unaffected and continues using the qcow2 image.
+
+---
+
 ## Optimizations TO TRY
 
 | Optimization | Expected Benefit | Notes |
 |--------------|------------------|-------|
-| Raw partition for Xbox HDD | Eliminate qcow2 overhead | Direct block device access instead of image file |
 | `num_workers = 1` audio | Less thread overhead | Reduce audio processing threads |
 | Process priority `nice -n -5` | Better CPU scheduling | Give xemu priority over system tasks |
 | IRQ affinity | Cleaner CPU for xemu | Move hardware interrupts to other cores |
