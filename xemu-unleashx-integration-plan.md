@@ -436,13 +436,23 @@ The installer writes the raw Xbox HDD image directly to partition 3, then update
 
 ---
 
-## Optimizations TO TRY
+## New Optimizations (Testing)
 
-| Optimization | Expected Benefit | Notes |
-|--------------|------------------|-------|
-| `num_workers = 1` audio | Less thread overhead | Reduce audio processing threads |
-| Process priority `nice -n -5` | Better CPU scheduling | Give xemu priority over system tasks |
-| IRQ affinity | Cleaner CPU for xemu | Move hardware interrupts to other cores |
+| Optimization | Status | Notes |
+|--------------|--------|-------|
+| `nice -n -5` | TESTING | Higher CPU priority for xemu |
+| `io-scheduler.service` | TESTING | Sets `mq-deadline` for SSD - reduces I/O overhead |
+| `hugepages.service` | TESTING | Allocates 128MB hugepages for Xbox RAM |
+| `-mem-path /dev/hugepages` | TESTING | Uses hugepages - reduces TLB misses significantly |
+
+---
+
+## Optimizations TO AVOID
+
+| Optimization | Why |
+|--------------|-----|
+| `num_workers = 1` audio | Causes audio crackling, tested previously |
+| IRQ affinity | Breaks things on J4205's 4 cores, tested previously |
 
 ---
 
