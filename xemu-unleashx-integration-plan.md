@@ -363,13 +363,20 @@ quiet mitigations=off
 [general]
 show_welcome = false
 
+[perf]
+cache_shaders = true
+hard_fpu = true
+
+[display.window]
+vsync = false
+
 [sys.files]
 bootrom_path = '/opt/xbox/bios/mcpx_1.0.bin'
 flashrom_path = '/opt/xbox/bios/Complex_4627.bin'
 eeprom_path = '/opt/xbox/eeprom.bin'
 hdd_path = '/opt/xbox/xbox_hdd.qcow2'
 ```
-Minimal config. No perf tweaks.
+Confirmed safe optimizations. DSP stays ON (use_dsp=false causes freezes).
 
 ### xinitrc
 ```bash
@@ -400,9 +407,9 @@ These were tried and made things WORSE:
 | Optimization | Why It Failed |
 |--------------|---------------|
 | `threadirqs` kernel param | Made entire OS sluggish - forces all IRQs to threads, adds scheduling overhead |
-| `XEMU_VCPU_AFFINITY=0` | Unknown impact, removed for baseline |
-| `cpu-performance.service` | Unknown impact, removed for baseline |
-| xemu.toml `hard_fpu`, `cache_shaders`, etc. | Unknown impact, removed for baseline |
+| `XEMU_VCPU_AFFINITY=0` | Unknown impact, reverted to baseline |
+| Vulkan renderer | SLOWER than OpenGL on Intel HD 505 - Intel's ANV driver has more overhead than iris/i965 |
+| `use_dsp = false` | Causes freezes! Games depend on audio timing. DSP must stay enabled |
 
 ---
 
@@ -410,8 +417,50 @@ These were tried and made things WORSE:
 
 | Optimization | Status | Notes |
 |--------------|--------|-------|
-| `mitigations=off` kernel param | ACTIVE | 5-15% gain, safe on J4205 (not affected by most vulns) |
-| `cpu-governor.service` | ACTIVE | Keeps CPU at 2.6GHz instead of throttling to 800MHz |
+| `mitigations=off` kernel param | CONFIRMED | 5-15% gain, safe on J4205 (not affected by most vulns) |
+| `cpu-governor.service` | CONFIRMED | Keeps CPU at 2.6GHz instead of throttling to 800MHz |
+| `cache_shaders = true` | CONFIRMED | Caches compiled shaders to disk, reduces CPU stutter |
+| `hard_fpu = true` | CONFIRMED | Hardware FPU instead of software emulation |
+| `vsync = false` | CONFIRMED | Big difference! Uncapped framerate, less input lag |
+
+---
+
+## Optimizations TO TRY
+
+| Optimization | Expected Benefit | Notes |
+|--------------|------------------|-------|
+| Raw partition for Xbox HDD | Eliminate qcow2 overhead | Direct block device access instead of image file |
+| `num_workers = 1` audio | Less thread overhead | Reduce audio processing threads |
+| Process priority `nice -n -5` | Better CPU scheduling | Give xemu priority over system tasks |
+| IRQ affinity | Cleaner CPU for xemu | Move hardware interrupts to other cores |
+
+---
+
+## Target Hardware
+
+| Component | Spec |
+|-----------|------|
+| CPU | Intel Pentium J4205 @ 1.50GHz (boost 2.6GHz) - Apollo Lake |
+| RAM | 12GB |
+| GPU | Intel HD Graphics 505 (i915 driver) |
+| Storage | 120GB SSD |
+| OS | Debian Trixie (minimal) |
+
+---
+
+## Iris Pro Issue (iMac)
+
+The iMac with Intel Iris Pro Graphics 5200 (i5-4570R @ 2.7GHz) crashes with:
+```
+xemu: ../hw/xbox/nv2a/pgraph/gl/shaders.c:730: apply_uniform_updates: Assertion `glGetError() == GL_NO_ERROR' failed.
+```
+
+This is a Mesa driver issue with NV2A shader uniform updates. Potential fixes to try:
+- Force Vulkan: `MESA_LOADER_DRIVER_OVERRIDE=zink`
+- GL version override: `MESA_GL_VERSION_OVERRIDE=4.5`
+- Different Mesa version
+
+The i5-4570R would be significantly faster than J4205 if we can get it working.
 
 ---
 
