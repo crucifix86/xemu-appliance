@@ -101,7 +101,7 @@ The installer creates 3 partitions:
 
 ## Requirements
 
-- xemu binary (build from https://github.com/xemu-project/xemu)
+- xemu binary (build from https://github.com/crucifix86/xemu)
 - Xbox BIOS: `mcpx_1.0.bin`, `Complex_4627.bin`
 - Xbox HDD image (qcow2 or raw)
 - Xbox EEPROM: `eeprom.bin`
