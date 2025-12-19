@@ -349,15 +349,14 @@ If you boot and get `grub>` prompt, something went wrong. Check:
 
 ---
 
-## Current Baseline State (2025-12-18)
+## Current State (2025-12-18)
 
-This is the known-working state. NO performance optimizations applied.
+Working state with safe optimizations only.
 
 ### Kernel Command Line
 ```
-quiet
+quiet mitigations=off
 ```
-That's it. No mitigations=off, no threadirqs, no nowatchdog.
 
 ### xemu.toml (Appliance)
 ```toml
@@ -383,7 +382,8 @@ No XEMU_VCPU_AFFINITY. No cpu pinning.
 ### Systemd Services
 - `xbox-network.service` - TAP network setup
 - `xemu.service` - launches xemu
-- NO `cpu-performance.service`
+- `cpu-governor.service` - sets CPU to performance mode
+- `log-specs.service` - logs system specs at boot
 
 ### Desktop Shortcut (Host)
 ```
@@ -406,13 +406,12 @@ These were tried and made things WORSE:
 
 ---
 
-## Safe Optimizations (TO BE TESTED)
-
-Add optimizations here ONE AT A TIME after testing:
+## Safe Optimizations (ACTIVE)
 
 | Optimization | Status | Notes |
 |--------------|--------|-------|
-| (none yet) | | |
+| `mitigations=off` kernel param | ACTIVE | 5-15% gain, safe on J4205 (not affected by most vulns) |
+| `cpu-governor.service` | ACTIVE | Keeps CPU at 2.6GHz instead of throttling to 800MHz |
 
 ---
 
