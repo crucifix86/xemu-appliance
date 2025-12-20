@@ -1,0 +1,10 @@
+# Large image files
+*.img
+*.qcow2
+
+# Rootfs (tracked separately or built from image)
+rootfs/
+
+# Build artifacts
+/mnt/
+*.log
