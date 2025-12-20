@@ -55,7 +55,7 @@ echo "[2/10] Creating partition table..."
 sudo parted $DEVICE --script mklabel gpt
 sudo parted $DEVICE --script mkpart ESP fat32 1MiB 513MiB
 sudo parted $DEVICE --script set 1 esp on
-sudo parted $DEVICE --script mkpart root ext4 513MiB 8705MiB
+sudo parted $DEVICE --script mkpart root ext4 513MiB 20GiB
 
 # 3. Format partitions
 echo "[3/10] Formatting partitions..."
