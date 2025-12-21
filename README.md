@@ -29,9 +29,20 @@ python3 usb-builder-gui.py
 ### Boot Options
 
 At the GRUB menu:
-- **Debian GNU/Linux** - Normal boot, starts xemu automatically
+- **Debian GNU/Linux** - Normal boot, starts xemu with OpenGL
 - **Install to Disk** - Interactive installer for internal drive
 - **xemu (Vulkan Renderer)** - Boot with Vulkan instead of OpenGL
+- **xemu (Intel Shader Fix)** - OpenGL with Mesa workarounds for Intel GPUs
+
+### GPU Compatibility
+
+| GPU | Recommended Boot |
+|-----|------------------|
+| Most GPUs | Debian GNU/Linux (default) |
+| Intel Haswell (Iris Pro) | xemu (Intel Shader Fix) |
+| Intel Apollo Lake | Works with default or Vulkan |
+
+**Note:** Vulkan does not work on Intel Haswell GPUs due to incomplete Mesa support.
 
 ## System Architecture
 

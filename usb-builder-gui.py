@@ -312,7 +312,7 @@ class USBBuilder:
             # Step 3: Format partitions
             self.set_step(3, "Formatting partitions...")
             self.set_substep("Formatting EFI partition (FAT32)...")
-            self.run_sudo(['mkfs.vfat', '-F32', f'{device}1'])
+            self.run_sudo(['mkfs.vfat', '-F32', '-n', 'XEMU_EFI', f'{device}1'])
             self.set_substep("Formatting root partition (ext4)...")
             self.run_sudo(['mkfs.ext4', '-F', '-L', self.root_label, f'{device}2'])
 
@@ -346,7 +346,7 @@ class USBBuilder:
 
             # Step 9: Update fstab
             self.set_step(9, "Updating fstab with EFI UUID...")
-            self.run_sudo(f"sed -i 's/UUID=EFI_UUID_PLACEHOLDER/UUID={efi_uuid}/' /mnt/usb-root/etc/fstab")
+            self.run_sudo(f"sed -i 's/UUID=EFI_UUID_PLACEHOLDER/LABEL=XEMU_EFI/' /mnt/usb-root/etc/fstab")
             self.log("Updated fstab:")
             self.run_cmd(['cat', '/mnt/usb-root/etc/fstab'])
 

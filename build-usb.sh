@@ -59,7 +59,7 @@ sudo parted $DEVICE --script mkpart root ext4 513MiB 20GiB
 
 # 3. Format partitions
 echo "[3/10] Formatting partitions..."
-sudo mkfs.vfat -F32 ${DEVICE}1
+sudo mkfs.vfat -F32 -n XEMU_EFI ${DEVICE}1
 sudo mkfs.ext4 -F -L $ROOT_LABEL ${DEVICE}2
 
 # 4. Verify label was set
@@ -89,7 +89,7 @@ sudo rsync -av $SOURCE/boot/efi/ /mnt/usb-efi/
 
 # 9. Update fstab with correct EFI UUID
 echo "[9/10] Updating fstab with EFI UUID..."
-sudo sed -i "s/UUID=EFI_UUID_PLACEHOLDER/UUID=$EFI_UUID/" /mnt/usb-root/etc/fstab
+sudo sed -i "s/UUID=EFI_UUID_PLACEHOLDER/LABEL=XEMU_EFI/" /mnt/usb-root/etc/fstab
 
 # Verify
 echo "Updated fstab:"
