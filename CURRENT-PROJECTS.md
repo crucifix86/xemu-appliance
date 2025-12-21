@@ -1,53 +1,28 @@
 # Current Projects
 
-## WiFi Detection Menu for xemu Settings
-
-**Status:** Planning
-**Goal:** Add WiFi network detection and connection UI to xemu settings, allowing users to connect to wireless networks without command-line tools.
-
-### Why This Is Needed
-- Many users boot the appliance on laptops or systems with WiFi only
-- Currently no way to connect to WiFi from the UI
-- Need network for FTP file transfers to Xbox HDD
-
-### Research Needed
-- How to scan for WiFi networks (iwlist, nmcli, wpa_supplicant)
-- How to connect to networks (WPA2, open, etc.)
-- What tools are available on the minimal rootfs
-- UI design for network list and password entry
-
-### Files to Modify
-| File | Changes |
-|------|---------|
-| `xemu-source/ui/xui/main-menu.cc` | Add WiFi section to Network settings |
-| `xemu-source/ui/xemu-wifi.c` (NEW) | WiFi scanning and connection wrapper |
-| `xemu-source/ui/xemu-wifi.h` (NEW) | Header for WiFi functions |
-| `xemu-source/ui/meson.build` | Add new source files |
-
-### UI Design (Proposed)
-```
-[Network Settings]
-├── WiFi
-│   ├── Status: Connected to "MyNetwork" / Not Connected
-│   ├── [Scan for Networks]
-│   ├── Available Networks:
-│   │   ├── MyNetwork      [====] 80%  [Connect]
-│   │   ├── Neighbor_5G    [===]  60%  [Connect]
-│   │   └── CoffeeShop     [==]   40%  [Connect]
-│   └── [Disconnect]
-└── Ethernet (existing)
-```
-
-### Implementation Steps
-1. Research WiFi tools available on minimal Debian
-2. Create WiFi wrapper (`xemu-wifi.c/.h`)
-3. Add UI elements to Network settings tab
-4. Test with various network types (WPA2, open)
-5. Handle password input dialog
+No active projects at the moment.
 
 ---
 
 ## Completed Tasks
+
+### Driver Manager Tab (Dec 2024)
+- Added new "Drivers" tab to xemu main menu
+- Uses `hwinfo` for hardware detection
+- Uses `isenkram-lookup` for driver/package suggestions
+- Shows detected hardware by category (GPU, sound, network, etc.)
+- Shows recommended packages with Install buttons
+- Created `xemu-drivers.c/.h` for detection wrapper
+- Added hwinfo, isenkram-cli, and dependencies to rootfs
+
+### WiFi Detection Menu (Dec 2024)
+- Added WiFi section to Settings > Network tab
+- Scan for available networks with signal strength
+- Password input for WPA networks
+- Connect/Disconnect functionality
+- Created `xemu-wifi.c/.h` using iw and wpa_supplicant
+- Added iw, wpa_supplicant, wpa_cli, rfkill to rootfs
+- Added libnl-3 and libnl-genl-3 libraries
 
 ### ALSA Mixer & Output Device Integration (Dec 2024)
 - Added ALSA mixer controls to Settings > Audio tab

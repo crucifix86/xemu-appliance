@@ -43,6 +43,8 @@
 #ifdef __linux__
 #include "../xemu-alsa-mixer.h"
 #include "../xemu-pulse-output.h"
+#include "../xemu-wifi.h"
+#include "../xemu-drivers.h"
 #endif
 
 #include "../thirdparty/fatx/fatx.h"
@@ -782,6 +784,116 @@ MainMenuNetworkView::MainMenuNetworkView()
 
 void MainMenuNetworkView::Draw()
 {
+#ifdef __linux__
+    /* WiFi Section */
+    static bool wifi_init_done = false;
+    static bool wifi_scanning = false;
+    static int selected_network = -1;
+    static char wifi_password[128] = {0};
+    static bool show_password_input = false;
+    static char connecting_ssid[64] = {0};
+
+    if (!wifi_init_done) {
+        wifi_init_done = true;
+        xemu_wifi_init();
+    }
+
+    if (xemu_wifi_available()) {
+        SectionTitle("WiFi");
+
+        /* Connection status */
+        bool connected = xemu_wifi_is_connected();
+        const char *current_ssid = xemu_wifi_get_current_ssid();
+
+        if (connected && current_ssid) {
+            char status_buf[128];
+            snprintf(status_buf, sizeof(status_buf), "Connected to: %s", current_ssid);
+            ImGui::TextUnformatted(status_buf);
+
+            if (ImGui::Button("Disconnect")) {
+                xemu_wifi_disconnect();
+            }
+        } else {
+            ImGui::TextUnformatted("Not connected");
+        }
+
+        ImGui::Spacing();
+
+        /* Scan button */
+        if (ImGui::Button(wifi_scanning ? "Scanning..." : "Scan for Networks")) {
+            wifi_scanning = true;
+            xemu_wifi_scan();
+            wifi_scanning = false;
+            selected_network = -1;
+        }
+
+        /* Network list */
+        int count = xemu_wifi_get_count();
+        if (count > 0) {
+            ImGui::Spacing();
+            ImGui::TextUnformatted("Available Networks:");
+
+            for (int i = 0; i < count && i < 10; i++) {
+                const xemu_wifi_network_t *net = xemu_wifi_get_network(i);
+                if (!net) continue;
+
+                ImGui::PushID(i);
+
+                /* Signal strength indicator */
+                char label[128];
+                const char *lock = net->encrypted ? " [*]" : "";
+                const char *conn = net->connected ? " (connected)" : "";
+                snprintf(label, sizeof(label), "%s%s%s - %d%%",
+                         net->ssid, lock, conn, net->signal_strength);
+
+                if (ImGui::Selectable(label, selected_network == i)) {
+                    selected_network = i;
+                    if (net->encrypted && !net->connected) {
+                        show_password_input = true;
+                        strncpy(connecting_ssid, net->ssid, sizeof(connecting_ssid) - 1);
+                        wifi_password[0] = '\0';
+                    } else if (!net->connected) {
+                        /* Open network - connect directly */
+                        xemu_wifi_connect(net->ssid, NULL);
+                    }
+                }
+
+                ImGui::PopID();
+            }
+        }
+
+        /* Password input dialog */
+        if (show_password_input) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            char pwd_label[128];
+            snprintf(pwd_label, sizeof(pwd_label), "Password for %s:", connecting_ssid);
+            ImGui::TextUnformatted(pwd_label);
+
+            ImGui::PushItemWidth(200);
+            ImGui::InputText("###wifi_pwd", wifi_password, sizeof(wifi_password),
+                             ImGuiInputTextFlags_Password);
+            ImGui::PopItemWidth();
+
+            ImGui::SameLine();
+            if (ImGui::Button("Connect")) {
+                xemu_wifi_connect(connecting_ssid, wifi_password);
+                show_password_input = false;
+                wifi_password[0] = '\0';
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                show_password_input = false;
+                wifi_password[0] = '\0';
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+    }
+#endif
+
     SectionTitle("Adapter");
     bool enabled = xemu_net_is_enabled();
     g_config.net.enable = enabled;
@@ -1416,6 +1528,83 @@ void MainMenuSystemView::Draw()
     }
 }
 
+void MainMenuDriversView::Draw()
+{
+#ifdef __linux__
+    static bool scan_done = false;
+    static bool scanning = false;
+
+    SectionTitle("Hardware Detection");
+
+    if (ImGui::Button(scanning ? "Scanning..." : "Scan Hardware")) {
+        scanning = true;
+        xemu_drivers_scan_hardware();
+        xemu_drivers_get_suggestions();
+        scanning = false;
+        scan_done = true;
+    }
+
+    if (scan_done) {
+        int device_count = xemu_drivers_get_device_count();
+        if (device_count > 0) {
+            ImGui::Spacing();
+            ImGui::TextUnformatted("Detected Hardware:");
+            ImGui::Separator();
+
+            const char *last_category = "";
+            for (int i = 0; i < device_count; i++) {
+                const xemu_hardware_device_t *dev = xemu_drivers_get_device(i);
+                if (!dev) continue;
+
+                /* Show category header when it changes */
+                if (strcmp(dev->category, last_category) != 0) {
+                    ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "%s:", dev->category);
+                    last_category = dev->category;
+                }
+
+                ImGui::BulletText("%s", dev->name);
+            }
+        }
+
+        int suggestion_count = xemu_drivers_get_suggestion_count();
+        if (suggestion_count > 0) {
+            ImGui::Spacing();
+            SectionTitle("Recommended Packages");
+
+            for (int i = 0; i < suggestion_count; i++) {
+                const xemu_driver_suggestion_t *sug = xemu_drivers_get_suggestion(i);
+                if (!sug) continue;
+
+                ImGui::PushID(i);
+
+                if (sug->installed) {
+                    ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f),
+                                       "[Installed] %s", sug->package);
+                } else {
+                    ImGui::Text("%s - %s", sug->package, sug->description);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Install")) {
+                        xemu_drivers_install_package(sug->package);
+                    }
+                }
+
+                ImGui::PopID();
+            }
+        } else if (device_count > 0) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f),
+                               "All recommended drivers are installed!");
+        }
+    } else {
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Click 'Scan Hardware' to detect devices and find drivers.");
+    }
+#else
+    ImGui::TextUnformatted("Driver Manager is only available on Linux.");
+#endif
+}
+
 MainMenuAboutView::MainMenuAboutView() : m_config_info_text{ NULL }
 {
 }
@@ -1554,6 +1743,7 @@ MainMenuScene::MainMenuScene()
       m_network_button("Network", ICON_FA_NETWORK_WIRED),
       m_snapshots_button("Snapshots", ICON_FA_CLOCK_ROTATE_LEFT),
       m_system_button("System", ICON_FA_MICROCHIP),
+      m_drivers_button("Drivers", ICON_FA_SCREWDRIVER_WRENCH),
       m_about_button("About", ICON_FA_CIRCLE_INFO)
 {
     m_had_focus_last_frame = false;
@@ -1565,6 +1755,7 @@ MainMenuScene::MainMenuScene()
     m_tabs.push_back(&m_network_button);
     m_tabs.push_back(&m_snapshots_button);
     m_tabs.push_back(&m_system_button);
+    m_tabs.push_back(&m_drivers_button);
     m_tabs.push_back(&m_about_button);
 
     m_views.push_back(&m_general_view);
@@ -1574,6 +1765,7 @@ MainMenuScene::MainMenuScene()
     m_views.push_back(&m_network_view);
     m_views.push_back(&m_snapshots_view);
     m_views.push_back(&m_system_view);
+    m_views.push_back(&m_drivers_view);
     m_views.push_back(&m_about_view);
 
     m_current_view_index = 0;
