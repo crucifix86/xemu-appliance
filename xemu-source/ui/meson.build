@@ -48,7 +48,7 @@ if host_os == 'darwin'
 endif
 
 if host_os == 'linux'
-  xemu_ss.add([gtk, alsa, files('xemu-os-utils-linux.c', 'xemu-alsa-mixer.c')])
+  xemu_ss.add([gtk, files('xemu-os-utils-linux.c', 'xemu-alsa-mixer.c', 'xemu-pulse-output.c')])
 elif host_os == 'windows'
   xemu_ss.add(files('xemu-os-utils-windows.c'))
 elif host_os == 'darwin'
@@ -56,6 +56,9 @@ elif host_os == 'darwin'
 endif
 xemu_ss.add(imgui, implot, stb_image, noc, sdl, opengl, fa, fpng, json, fatx)
 system_ss.add_all(xemu_ss)
+if host_os == 'linux'
+  system_ss.add(alsa)
+endif
 
 system_ss.add(when: pixman, if_true: files('console-vc.c'), if_false: files('console-vc-stubs.c'))
 if dbus_display

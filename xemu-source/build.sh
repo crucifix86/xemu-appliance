@@ -196,7 +196,7 @@ case "$platform" in # Adjust compilation options based on platform
     Linux)
         echo 'Compiling for Linux...'
         sys_cflags='-Wno-error=redundant-decls'
-        opts="$opts --disable-werror"
+        opts="$opts --disable-werror --enable-alsa"
         postbuild='package_linux'
         ;;
     Darwin)

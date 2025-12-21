@@ -1,152 +1,61 @@
 # Current Projects
 
-## ALSA Mixer Integration for xemu Settings
+## WiFi Detection Menu for xemu Settings
 
-**Status:** Implementation Complete - Needs Testing
-**Goal:** Add ALSA mixer controls to xemu's Audio settings tab so users can adjust Master, PCM, Speaker, Headphone volumes directly from the emulator.
+**Status:** Planning
+**Goal:** Add WiFi network detection and connection UI to xemu settings, allowing users to connect to wireless networks without command-line tools.
 
 ### Why This Is Needed
-- ALSA channels are often muted by default on Linux
-- Currently requires command-line `amixer` to unmute
-- Users should be able to control audio from xemu UI
+- Many users boot the appliance on laptops or systems with WiFi only
+- Currently no way to connect to WiFi from the UI
+- Need network for FTP file transfers to Xbox HDD
+
+### Research Needed
+- How to scan for WiFi networks (iwlist, nmcli, wpa_supplicant)
+- How to connect to networks (WPA2, open, etc.)
+- What tools are available on the minimal rootfs
+- UI design for network list and password entry
 
 ### Files to Modify
-
 | File | Changes |
 |------|---------|
-| `xemu-source/ui/xui/main-menu.cc` | Add mixer sliders to `MainMenuAudioView::Draw()` |
-| `xemu-source/ui/xui/main-menu.hh` | Add mixer state variables to class |
-| `xemu-source/ui/xemu-alsa-mixer.c` (NEW) | ALSA mixer wrapper functions |
-| `xemu-source/ui/xemu-alsa-mixer.h` (NEW) | Header for mixer functions |
+| `xemu-source/ui/xui/main-menu.cc` | Add WiFi section to Network settings |
+| `xemu-source/ui/xemu-wifi.c` (NEW) | WiFi scanning and connection wrapper |
+| `xemu-source/ui/xemu-wifi.h` (NEW) | Header for WiFi functions |
 | `xemu-source/ui/meson.build` | Add new source files |
 
-### Current Audio Tab Location
-- **File:** `xemu-source/ui/xui/main-menu.cc`
-- **Lines:** 604-616
-- **Class:** `MainMenuAudioView::Draw()`
-
-```cpp
-void MainMenuAudioView::Draw()
-{
-    SectionTitle("Volume");
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Limit output volume (%d%%)",
-             (int)(g_config.audio.volume_limit * 100));
-    Slider("Output volume limit", &g_config.audio.volume_limit, buf);
-
-    SectionTitle("Quality");
-    Toggle("Real-time DSP processing", &g_config.audio.use_dsp,
-           "Enable improved audio accuracy (experimental)");
-}
+### UI Design (Proposed)
 ```
-
-### New ALSA Mixer Wrapper API
-
-Create `xemu-source/ui/xemu-alsa-mixer.h`:
-```c
-#ifndef XEMU_ALSA_MIXER_H
-#define XEMU_ALSA_MIXER_H
-
-#include <stdbool.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int xemu_mixer_init(void);
-void xemu_mixer_cleanup(void);
-int xemu_mixer_get_count(void);
-const char* xemu_mixer_get_name(int index);
-int xemu_mixer_get_volume(int index);
-void xemu_mixer_set_volume(int index, int vol);
-bool xemu_mixer_get_switch(int index);
-void xemu_mixer_set_switch(int index, bool on);
-void xemu_mixer_refresh(void);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif
-```
-
-### Extended Audio Tab UI Design
-
-```
-[Audio Settings]
-├── Volume
-│   └── Output volume limit [====|====] 100%
-├── ALSA Mixer
-│   ├── Master [========|==] 80%  [x] Unmute
-│   ├── PCM    [==========] 100%  [x] Unmute
-│   ├── Speaker [========|==] 80% [x] Unmute
-│   └── Headphone [======|====] 60% [ ] Muted
-└── Quality
-    └── [x] Real-time DSP processing
+[Network Settings]
+├── WiFi
+│   ├── Status: Connected to "MyNetwork" / Not Connected
+│   ├── [Scan for Networks]
+│   ├── Available Networks:
+│   │   ├── MyNetwork      [====] 80%  [Connect]
+│   │   ├── Neighbor_5G    [===]  60%  [Connect]
+│   │   └── CoffeeShop     [==]   40%  [Connect]
+│   └── [Disconnect]
+└── Ethernet (existing)
 ```
 
 ### Implementation Steps
-
-1. **Create ALSA mixer wrapper** (`xemu-alsa-mixer.c/.h`)
-   - Use `snd_mixer_*` functions from ALSA lib
-   - Enumerate playback volume controls
-   - Get/set volume and mute switch
-
-2. **Update meson.build**
-   - Add new source files
-   - Link against libasound
-
-3. **Modify MainMenuAudioView::Draw()**
-   - Call `xemu_mixer_init()` on first draw
-   - Add SectionTitle("ALSA Mixer")
-   - Loop through mixer controls
-   - Add Slider for each volume
-   - Add Toggle for each mute switch
-
-4. **Test and iterate**
-
-### Key ALSA Functions Reference
-
-```c
-#include <alsa/asoundlib.h>
-
-snd_mixer_t *handle;
-snd_mixer_open(&handle, 0);
-snd_mixer_attach(handle, "default");
-snd_mixer_selem_register(handle, NULL, NULL);
-snd_mixer_load(handle);
-
-// Iterate elements
-snd_mixer_elem_t *elem;
-for (elem = snd_mixer_first_elem(handle); elem; elem = snd_mixer_elem_next(elem)) {
-    if (snd_mixer_selem_has_playback_volume(elem)) {
-        const char *name = snd_mixer_selem_get_name(elem);
-        long min, max, vol;
-        snd_mixer_selem_get_playback_volume_range(elem, &min, &max);
-        snd_mixer_selem_get_playback_volume(elem, SND_MIXER_SCHN_MONO, &vol);
-        // vol is between min and max
-    }
-}
-```
-
-### UI Framework Reference
-
-xemu uses Dear ImGui. Available widgets in `widgets.cc`:
-- `SectionTitle(const char *title)` - Section header
-- `Slider(const char *str_id, float *v, const char *description)` - 0.0-1.0 range
-- `Toggle(const char *str_id, bool *v, const char *description)` - Boolean toggle
-
-### Build Command
-```bash
-cd xemu-source
-./build.sh
-```
-
-Binary output: `xemu-source/dist/xemu`
+1. Research WiFi tools available on minimal Debian
+2. Create WiFi wrapper (`xemu-wifi.c/.h`)
+3. Add UI elements to Network settings tab
+4. Test with various network types (WPA2, open)
+5. Handle password input dialog
 
 ---
 
 ## Completed Tasks
+
+### ALSA Mixer & Output Device Integration (Dec 2024)
+- Added ALSA mixer controls to Settings > Audio tab
+- Added PulseAudio output device selector (speakers/headphones/HDMI)
+- Created `xemu-alsa-mixer.c/.h` for mixer volume/mute control
+- Created `xemu-pulse-output.c/.h` for output device selection
+- Modified `build.sh` to enable ALSA (`--enable-alsa`)
+- Modified `ui/meson.build` to link ALSA library
 
 ### Audio Support (Dec 2024)
 - Added PulseAudio startup to .xinitrc

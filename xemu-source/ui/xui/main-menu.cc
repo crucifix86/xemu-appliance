@@ -42,6 +42,7 @@
 
 #ifdef __linux__
 #include "../xemu-alsa-mixer.h"
+#include "../xemu-pulse-output.h"
 #endif
 
 #include "../thirdparty/fatx/fatx.h"
@@ -614,6 +615,39 @@ void MainMenuAudioView::Draw()
     Slider("Output volume limit", &g_config.audio.volume_limit, buf);
 
 #ifdef __linux__
+    /* PulseAudio Output Device Selection */
+    static bool pulse_init_done = false;
+    static int pulse_output_index = 0;
+
+    if (!pulse_init_done) {
+        pulse_init_done = true;
+        xemu_pulse_refresh();
+        pulse_output_index = xemu_pulse_get_default_index();
+        if (pulse_output_index < 0) pulse_output_index = 0;
+    }
+
+    int pulse_count = xemu_pulse_get_count();
+    if (pulse_count > 0) {
+        SectionTitle("Output Device");
+
+        /* Build items string for ChevronCombo */
+        static char items_buf[4096];
+        char *p = items_buf;
+        for (int i = 0; i < pulse_count && p < items_buf + sizeof(items_buf) - 256; i++) {
+            const char *name = xemu_pulse_get_name(i);
+            if (name) {
+                strcpy(p, name);
+                p += strlen(name) + 1;
+            }
+        }
+        *p = '\0'; /* Double null terminator */
+
+        if (ChevronCombo("Audio output", &pulse_output_index, items_buf,
+                         "Select audio output device (speakers, headphones, HDMI)")) {
+            xemu_pulse_set_default(pulse_output_index);
+        }
+    }
+
     /* ALSA Mixer Controls */
     static bool mixer_init_attempted = false;
     static bool mixer_available = false;
