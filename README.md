@@ -7,6 +7,7 @@ A standalone bootable Linux system that runs [xemu](https://xemu.app) - the orig
 - **Boots directly into xemu** - No desktop environment, just the emulator
 - **USB bootable** - Create a bootable USB drive in minutes
 - **Disk installer** - Install to internal drive for permanent setup
+- **Audio support** - PulseAudio with automatic ALSA unmuting
 - **Network bridging** - TAP interface with DHCP for FTP game transfers
 - **Vulkan support** - Optional Vulkan rendering via kernel parameter
 

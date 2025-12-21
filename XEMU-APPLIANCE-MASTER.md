@@ -210,6 +210,17 @@ hdd_path = '/opt/xbox/xbox_hdd.qcow2'
 enable = false
 CONF
 
+# Unmute ALSA and set volume (often muted by default)
+amixer sset Master unmute 2>/dev/null
+amixer sset Master 100% 2>/dev/null
+amixer sset PCM unmute 2>/dev/null
+amixer sset PCM 100% 2>/dev/null
+amixer sset Speaker unmute 2>/dev/null
+amixer sset Headphone unmute 2>/dev/null
+
+# Start PulseAudio for audio support
+pulseaudio --start --daemonize
+
 exec /opt/xbox/xemu -m 64 -net nic,model=nvnet -net tap,ifname=tap0,script=no,downscript=no
 ```
 
@@ -247,6 +258,53 @@ interface=tap0
 dhcp-range=192.168.100.10,192.168.100.50,12h
 bind-interfaces
 ```
+
+---
+
+## Audio Configuration
+
+### Architecture
+```
+ALSA (kernel driver: snd-hda-intel)
+    │
+    amixer (unmute + volume)
+    │
+PulseAudio (user daemon)
+    │
+SDL2 audio backend
+    │
+xemu (AC97 emulation)
+```
+
+### Kernel Modules
+`/etc/modules-load.d/audio.conf`:
+```
+snd-hda-intel
+snd-hda-codec-realtek
+snd-hda-codec-hdmi
+```
+
+### Audio Initialization in ~/.xinitrc
+```bash
+# Unmute ALSA and set volume (often muted by default)
+amixer sset Master unmute 2>/dev/null
+amixer sset Master 100% 2>/dev/null
+amixer sset PCM unmute 2>/dev/null
+amixer sset PCM 100% 2>/dev/null
+amixer sset Speaker unmute 2>/dev/null
+amixer sset Headphone unmute 2>/dev/null
+
+# Start PulseAudio for audio support
+pulseaudio --start --daemonize
+```
+
+### Why Explicit Unmuting?
+ALSA often initializes with channels muted by default. Without explicit unmuting:
+- PulseAudio starts successfully
+- xemu's SDL audio backend connects
+- No sound output because ALSA mixer is muted
+
+The `amixer` commands unmute common channel names. Errors are suppressed (`2>/dev/null`) since not all systems have all channels.
 
 ---
 
@@ -379,6 +437,15 @@ Applies Mesa workarounds for Intel GPUs with shader issues:
 **Symptom:** Log shows `vk_result = -2` and "Haswell Vulkan support is incomplete"
 **Cause:** Mesa's Vulkan support for older Intel GPUs is incomplete.
 **Fix:** Use OpenGL mode instead (default or Intel Shader Fix).
+
+### No audio output
+**Symptom:** xemu runs but no sound from games.
+**Cause:** ALSA channels muted by default, or PulseAudio not running.
+**Check:**
+- Run `amixer` to see mixer state
+- Run `pactl info` to check PulseAudio status
+- Check `/home/xbox/.config/pulse/` for PulseAudio state files
+**Fix:** Ensure `.xinitrc` runs amixer unmute commands before PulseAudio starts.
 
 ---
 
