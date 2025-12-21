@@ -90,6 +90,7 @@ class MainMenuNetworkView : public virtual MainMenuTabView
 protected:
     char remote_addr[64];
     char local_addr[64];
+    char tap_ifname[32];
     bool should_refresh;
     std::unique_ptr<NetworkInterfaceManager> iface_mgr;
 
@@ -99,6 +100,7 @@ public:
     void DrawPcapOptions(bool appearing);
     void DrawNatOptions(bool appearing);
     void DrawUdpOptions(bool appearing);
+    void DrawTapOptions(bool appearing);
 };
 
 class MainMenuSnapshotsView : public virtual MainMenuTabView

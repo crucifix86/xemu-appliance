@@ -75,6 +75,19 @@ void xemu_net_enable(void)
         qdict_put_str(qdict, "id",        id);
         qdict_put_str(qdict, "type",      "pcap");
         qdict_put_str(qdict, "ifname",    g_config.net.pcap.netif);
+    } else if (g_config.net.backend == CONFIG_NET_BACKEND_TAP) {
+#if !defined(_WIN32)
+        qdict = qdict_new();
+        qdict_put_str(qdict, "id",        id);
+        qdict_put_str(qdict, "type",      "tap");
+        qdict_put_str(qdict, "ifname",    g_config.net.tap.ifname);
+        qdict_put_str(qdict, "script",    "no");
+        qdict_put_str(qdict, "downscript", "no");
+        qdict_put_bool(qdict, "vnet_hdr", false);  /* Disable for non-virtio NIC */
+#else
+        // TAP not supported on Windows
+        return;
+#endif
     } else {
         // Unsupported backend type
         return;

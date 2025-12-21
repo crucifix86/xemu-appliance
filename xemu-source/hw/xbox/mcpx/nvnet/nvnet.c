@@ -31,6 +31,130 @@
 #include "qemu/iov.h"
 #include "migration/vmstate.h"
 #include "nvnet_regs.h"
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <poll.h>
+#include <pthread.h>
+#include <time.h>
+
+/* ============================================================================
+ * NVNet Direct Network Proxy - Bypasses TAP entirely
+ *
+ * Intercepts all Xbox network traffic and proxies it through real sockets.
+ * This allows the Xbox to have a real network presence without TAP.
+ * ============================================================================ */
+
+/* DHCP constants */
+#define DHCP_SERVER_PORT 67
+#define DHCP_CLIENT_PORT 68
+#define DHCP_MAGIC_COOKIE 0x63825363
+#define DHCP_DISCOVER 1
+#define DHCP_OFFER    2
+#define DHCP_REQUEST  3
+#define DHCP_ACK      5
+
+/* Proxy configuration */
+#define MAX_TCP_CONNS 64
+#define MAX_UDP_CONNS 32
+#define PROXY_POLL_MS 10
+
+/* TCP connection tracking */
+typedef struct {
+    int active;
+    int socket_fd;
+    uint32_t xbox_ip;
+    uint16_t xbox_port;
+    uint32_t remote_ip;
+    uint16_t remote_port;
+    uint32_t seq_out;      /* Next seq to send to Xbox */
+    uint32_t ack_out;      /* Last ack sent to Xbox */
+    uint32_t seq_in;       /* Next seq expected from Xbox */
+    uint8_t state;         /* 0=closed, 1=syn_sent, 2=established, 3=fin_wait */
+} tcp_conn_t;
+
+/* UDP "connection" tracking */
+typedef struct {
+    int active;
+    int socket_fd;
+    uint32_t xbox_ip;
+    uint16_t xbox_port;
+    uint32_t remote_ip;
+    uint16_t remote_port;
+    time_t last_used;
+} udp_conn_t;
+
+/* Global proxy state */
+static uint32_t nvnet_dhcp_client_ip = 0;
+static uint32_t nvnet_dhcp_gateway = 0;
+static uint32_t nvnet_dhcp_dns = 0x08080808;
+static uint32_t nvnet_dhcp_server_ip = 0;
+static int nvnet_proxy_enabled = 0;
+static uint8_t nvnet_xbox_mac[6] = {0};
+static uint8_t nvnet_host_mac[6] = {0x00, 0x50, 0x56, 0xC0, 0x00, 0x01};
+
+static tcp_conn_t tcp_conns[MAX_TCP_CONNS];
+static udp_conn_t udp_conns[MAX_UDP_CONNS];
+static pthread_mutex_t proxy_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Inbound connection tracking (for FTP, etc.) */
+typedef struct {
+    int active;
+    int listen_fd;      /* Listening socket */
+    int client_fd;      /* Connected client socket */
+    uint32_t client_ip; /* Real client's IP */
+    uint16_t client_port;
+    uint16_t xbox_port; /* Port on Xbox (e.g., 21 for FTP) */
+    uint8_t state;      /* 0=listening, 1=syn_sent, 2=established */
+    uint32_t seq_to_xbox;
+    uint32_t seq_to_client;
+} inbound_conn_t;
+
+#define MAX_INBOUND_CONNS 8
+static inbound_conn_t inbound_conns[MAX_INBOUND_CONNS];
+static int inbound_initialized = 0;
+
+/* Forward declarations - NvNetState defined later, use void* */
+struct NvNetState;
+static ssize_t dma_packet_to_guest(struct NvNetState *s, const uint8_t *buf, size_t size);
+static void init_inbound_listeners(void);
+
+/* Debug logging to file - use /home/xbox for persistence (tmpfs loses data) */
+static void nvnet_log(const char *fmt, ...)
+{
+    FILE *f = fopen("/home/xbox/nvnet.log", "a");
+    if (f) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        fprintf(f, "[%ld.%03ld] ", ts.tv_sec % 10000, ts.tv_nsec / 1000000);
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(f, fmt, args);
+        fprintf(f, "\n");
+        va_end(args);
+        fclose(f);
+    }
+}
+
+void nvnet_set_dhcp_config(uint32_t client_ip, uint32_t gateway, uint32_t server_ip)
+{
+    nvnet_dhcp_client_ip = client_ip;
+    nvnet_dhcp_gateway = gateway;
+    nvnet_dhcp_server_ip = server_ip;
+    nvnet_proxy_enabled = (client_ip != 0);
+
+    /* Initialize connection tables */
+    memset(tcp_conns, 0, sizeof(tcp_conns));
+    memset(udp_conns, 0, sizeof(udp_conns));
+
+    nvnet_log("NVNet Proxy: enabled=%d xbox_ip=%08x gw=%08x host=%08x",
+            nvnet_proxy_enabled, client_ip, gateway, server_ip);
+    fprintf(stderr, "NVNet Proxy: enabled=%d xbox_ip=%08x gw=%08x host=%08x\n",
+            nvnet_proxy_enabled, client_ip, gateway, server_ip);
+}
 
 #define IOPORT_SIZE 0x8
 #define MMIO_SIZE 0x400
@@ -71,6 +195,7 @@ typedef struct NvNetState {
     uint8_t rx_dma_buf[RX_ALLOC_BUFSIZE];
 
     QEMUTimer *autoneg_timer;
+    QEMUTimer *proxy_poll_timer;
 
     /* Deprecated */
     uint8_t tx_ring_index;
@@ -256,12 +381,915 @@ static void set_mii_intr_status(NvNetState *s, uint32_t status)
     // FIXME: MII status mask?
 }
 
+/* ============================================================================
+ * Checksum helpers
+ * ============================================================================ */
+static uint16_t ip_checksum(const uint8_t *data, size_t len)
+{
+    uint32_t sum = 0;
+    for (size_t i = 0; i < len; i += 2) {
+        uint16_t word = (data[i] << 8);
+        if (i + 1 < len) word |= data[i + 1];
+        sum += word;
+    }
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return ~sum;
+}
+
+static uint16_t tcp_udp_checksum(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
+                                  const uint8_t *data, size_t len)
+{
+    uint32_t sum = 0;
+    /* Pseudo header */
+    sum += (src_ip >> 16) & 0xFFFF;
+    sum += src_ip & 0xFFFF;
+    sum += (dst_ip >> 16) & 0xFFFF;
+    sum += dst_ip & 0xFFFF;
+    sum += proto;
+    sum += len;
+    /* Data */
+    for (size_t i = 0; i < len; i += 2) {
+        uint16_t word = (data[i] << 8);
+        if (i + 1 < len) word |= data[i + 1];
+        sum += word;
+    }
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return ~sum;
+}
+
+/* ============================================================================
+ * ARP Handler - Respond to ARP requests for gateway/DNS
+ * ============================================================================ */
+static int handle_arp_packet(NvNetState *s, const uint8_t *buf, size_t size)
+{
+    if (!nvnet_proxy_enabled || size < 42) return 0;
+
+    uint16_t ethertype = (buf[12] << 8) | buf[13];
+    if (ethertype != 0x0806) return 0; /* Not ARP */
+
+    uint16_t arp_op = (buf[20] << 8) | buf[21];
+    if (arp_op != 1) return 0; /* Not ARP request */
+
+    uint32_t target_ip;
+    memcpy(&target_ip, buf + 38, 4);
+
+    /* Save Xbox MAC for future use */
+    memcpy(nvnet_xbox_mac, buf + 6, 6);
+
+    nvnet_log("ARP request for %08x from Xbox (xbox_ip=%08x)", ntohl(target_ip), ntohl(nvnet_dhcp_client_ip));
+
+    /* DON'T respond to ARP for Xbox's own IP - this is Duplicate Address Detection!
+     * If we respond, Xbox thinks there's an IP conflict and declines DHCP */
+    if (target_ip == nvnet_dhcp_client_ip) {
+        nvnet_log("ARP: Ignoring DAD probe for Xbox's own IP");
+        return 1; /* Consume but don't respond */
+    }
+
+    fprintf(stderr, "NVNet: ARP request for %08x\n", ntohl(target_ip));
+
+    /* Build ARP reply */
+    uint8_t reply[42];
+    memcpy(reply, buf + 6, 6);       /* Dst MAC = requester */
+    memcpy(reply + 6, nvnet_host_mac, 6);  /* Src MAC = our fake MAC */
+    reply[12] = 0x08; reply[13] = 0x06;    /* ARP */
+    reply[14] = 0x00; reply[15] = 0x01;    /* Ethernet */
+    reply[16] = 0x08; reply[17] = 0x00;    /* IPv4 */
+    reply[18] = 6;                          /* HW size */
+    reply[19] = 4;                          /* Proto size */
+    reply[20] = 0x00; reply[21] = 0x02;    /* ARP reply */
+    memcpy(reply + 22, nvnet_host_mac, 6); /* Sender MAC */
+    memcpy(reply + 28, &target_ip, 4);     /* Sender IP (the one asked for) */
+    memcpy(reply + 32, buf + 6, 6);        /* Target MAC */
+    memcpy(reply + 38, buf + 28, 4);       /* Target IP */
+
+    dma_packet_to_guest(s, reply, 42);
+    return 1;
+}
+
+/* ============================================================================
+ * DHCP Handler - Always intercepts DHCP to prevent slirp from responding
+ * ============================================================================ */
+static int handle_dhcp_packet(NvNetState *s, const uint8_t *buf, size_t size)
+{
+    nvnet_log("handle_dhcp_packet called, size=%zu", size);
+
+    if (size < 282) {
+        nvnet_log("DHCP: size too small %zu < 282", size);
+        return 0;
+    }
+
+    uint16_t ethertype = (buf[12] << 8) | buf[13];
+    if (ethertype != 0x0800) return 0;
+
+    uint8_t protocol = buf[14 + 9];
+    if (protocol != 17) return 0;
+
+    uint16_t dst_port = (buf[14 + 20 + 2] << 8) | buf[14 + 20 + 3];
+    if (dst_port != DHCP_SERVER_PORT) {
+        nvnet_log("DHCP: not port 67, got %d", dst_port);
+        return 0;
+    }
+
+    nvnet_log("DHCP: Got packet to port 67!");
+
+    const uint8_t *dhcp = buf + 14 + 20 + 8;
+    if (dhcp[0] != 1) return 0;
+
+    const uint8_t *options = dhcp + 240;
+    int dhcp_msg_type = 0;
+    while (options < buf + size - 2) {
+        if (options[0] == 255) break;
+        if (options[0] == 0) { options++; continue; }
+        if (options[0] == 53 && options[1] >= 1) {
+            dhcp_msg_type = options[2];
+            break;
+        }
+        options += 2 + options[1];
+    }
+
+    nvnet_log("DHCP: msg_type=%d (1=DISCOVER, 3=REQUEST)", dhcp_msg_type);
+
+    if (dhcp_msg_type != DHCP_DISCOVER && dhcp_msg_type != DHCP_REQUEST) return 0;
+
+    /* Always intercept DHCP to prevent slirp from responding */
+    /* Save Xbox MAC */
+    memcpy(nvnet_xbox_mac, buf + 6, 6);
+
+    /* Auto-detect host network if proxy not configured */
+    if (!nvnet_proxy_enabled) {
+        fprintf(stderr, "NVNet: DHCP %s - auto-detecting host network...\n",
+                dhcp_msg_type == DHCP_DISCOVER ? "DISCOVER" : "REQUEST");
+
+        /* Try to get host's IP and gateway */
+        FILE *fp = popen("ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \\K[0-9.]+'", "r");
+        if (fp) {
+            char host_ip[32] = {0};
+            if (fgets(host_ip, sizeof(host_ip), fp)) {
+                host_ip[strcspn(host_ip, "\n")] = 0;
+                if (strlen(host_ip) > 0) {
+                    int a, b, c, d;
+                    if (sscanf(host_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4) {
+                        /* Calculate Xbox IP (host + 1) */
+                        int xbox_d = d + 1;
+                        if (xbox_d > 254) xbox_d = 2;
+
+                        nvnet_dhcp_client_ip = htonl((a << 24) | (b << 16) | (c << 8) | xbox_d);
+                        nvnet_dhcp_server_ip = htonl((a << 24) | (b << 16) | (c << 8) | d);
+
+                        fprintf(stderr, "NVNet: Auto-detected host IP: %s, Xbox will be %d.%d.%d.%d\n",
+                                host_ip, a, b, c, xbox_d);
+                    }
+                }
+            }
+            pclose(fp);
+        }
+
+        /* Get gateway */
+        fp = popen("ip route get 8.8.8.8 2>/dev/null | grep -oP 'via \\K[0-9.]+'", "r");
+        if (fp) {
+            char gw[32] = {0};
+            if (fgets(gw, sizeof(gw), fp)) {
+                gw[strcspn(gw, "\n")] = 0;
+                if (strlen(gw) > 0) {
+                    nvnet_dhcp_gateway = inet_addr(gw);
+                    fprintf(stderr, "NVNet: Auto-detected gateway: %s\n", gw);
+                }
+            }
+            pclose(fp);
+        }
+
+        /* Enable proxy if we got valid IPs */
+        if (nvnet_dhcp_client_ip != 0 && nvnet_dhcp_gateway != 0) {
+            nvnet_proxy_enabled = 1;
+            fprintf(stderr, "NVNet: Proxy auto-enabled!\n");
+            /* Start inbound listeners immediately */
+            init_inbound_listeners();
+            /* Start poll timer for proxy RX (20ms interval) */
+            timer_mod(s->proxy_poll_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 20);
+        } else {
+            fprintf(stderr, "NVNet: Could not auto-detect network, dropping DHCP\n");
+            return 1;
+        }
+    }
+
+    fprintf(stderr, "NVNet: DHCP %s\n",
+            dhcp_msg_type == DHCP_DISCOVER ? "DISCOVER" : "REQUEST");
+
+    uint8_t resp[512];
+    memset(resp, 0, sizeof(resp));
+
+    memcpy(resp, nvnet_xbox_mac, 6);
+    memcpy(resp + 6, nvnet_host_mac, 6);
+    resp[12] = 0x08; resp[13] = 0x00;
+
+    uint8_t *ip = resp + 14;
+    ip[0] = 0x45; ip[8] = 64; ip[9] = 17;
+    memcpy(ip + 12, &nvnet_dhcp_server_ip, 4);
+    uint32_t bcast = 0xFFFFFFFF;
+    memcpy(ip + 16, &bcast, 4);
+
+    uint8_t *udp = ip + 20;
+    udp[0] = 0; udp[1] = DHCP_SERVER_PORT;
+    udp[2] = 0; udp[3] = DHCP_CLIENT_PORT;
+
+    uint8_t *bootp = udp + 8;
+    bootp[0] = 2; bootp[1] = 1; bootp[2] = 6;
+    memcpy(bootp + 4, dhcp + 4, 4);
+    bootp[10] = 0x80;
+    memcpy(bootp + 16, &nvnet_dhcp_client_ip, 4);
+    memcpy(bootp + 20, &nvnet_dhcp_server_ip, 4);
+    memcpy(bootp + 28, nvnet_xbox_mac, 6);
+
+    bootp[236] = 99; bootp[237] = 130; bootp[238] = 83; bootp[239] = 99;
+
+    uint8_t *opt = bootp + 240;
+    *opt++ = 53; *opt++ = 1;
+    *opt++ = (dhcp_msg_type == DHCP_DISCOVER) ? DHCP_OFFER : DHCP_ACK;
+    *opt++ = 54; *opt++ = 4; memcpy(opt, &nvnet_dhcp_server_ip, 4); opt += 4;
+    *opt++ = 51; *opt++ = 4; uint32_t lease = htonl(86400); memcpy(opt, &lease, 4); opt += 4;
+    *opt++ = 1; *opt++ = 4; uint32_t mask = htonl(0xFFFFFF00); memcpy(opt, &mask, 4); opt += 4;
+    *opt++ = 3; *opt++ = 4; memcpy(opt, &nvnet_dhcp_gateway, 4); opt += 4;
+    *opt++ = 6; *opt++ = 4; memcpy(opt, &nvnet_dhcp_dns, 4); opt += 4;
+    *opt++ = 255;
+
+    size_t bootp_len = (opt - bootp);
+    size_t udp_len = 8 + bootp_len;
+    size_t ip_len = 20 + udp_len;
+
+    ip[2] = ip_len >> 8; ip[3] = ip_len & 0xFF;
+    udp[4] = udp_len >> 8; udp[5] = udp_len & 0xFF;
+
+    uint16_t cksum = ip_checksum(ip, 20);
+    ip[10] = cksum >> 8; ip[11] = cksum & 0xFF;
+
+    nvnet_log("Sending DHCP %s to Xbox IP %08x",
+            dhcp_msg_type == DHCP_DISCOVER ? "OFFER" : "ACK",
+            ntohl(nvnet_dhcp_client_ip));
+    ssize_t sent = dma_packet_to_guest(s, resp, 14 + ip_len);
+    nvnet_log("dma_packet_to_guest returned %zd", sent);
+    fprintf(stderr, "NVNet: Sent DHCP %s\n",
+            dhcp_msg_type == DHCP_DISCOVER ? "OFFER" : "ACK");
+    return 1;
+}
+
+/* ============================================================================
+ * UDP Proxy
+ * ============================================================================ */
+static int find_or_create_udp_conn(uint16_t xbox_port, uint32_t remote_ip, uint16_t remote_port)
+{
+    int free_slot = -1;
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&proxy_mutex);
+    for (int i = 0; i < MAX_UDP_CONNS; i++) {
+        if (udp_conns[i].active &&
+            udp_conns[i].xbox_port == xbox_port &&
+            udp_conns[i].remote_ip == remote_ip &&
+            udp_conns[i].remote_port == remote_port) {
+            udp_conns[i].last_used = now;
+            pthread_mutex_unlock(&proxy_mutex);
+            return i;
+        }
+        if (!udp_conns[i].active && free_slot < 0) {
+            free_slot = i;
+        }
+        /* Expire old entries */
+        if (udp_conns[i].active && now - udp_conns[i].last_used > 60) {
+            close(udp_conns[i].socket_fd);
+            udp_conns[i].active = 0;
+            if (free_slot < 0) free_slot = i;
+        }
+    }
+
+    if (free_slot < 0) {
+        pthread_mutex_unlock(&proxy_mutex);
+        return -1;
+    }
+
+    int sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (sock < 0) {
+        pthread_mutex_unlock(&proxy_mutex);
+        return -1;
+    }
+
+    udp_conns[free_slot].active = 1;
+    udp_conns[free_slot].socket_fd = sock;
+    udp_conns[free_slot].xbox_ip = nvnet_dhcp_client_ip;
+    udp_conns[free_slot].xbox_port = xbox_port;
+    udp_conns[free_slot].remote_ip = remote_ip;
+    udp_conns[free_slot].remote_port = remote_port;
+    udp_conns[free_slot].last_used = now;
+
+    pthread_mutex_unlock(&proxy_mutex);
+    return free_slot;
+}
+
+static int handle_udp_packet(NvNetState *s, const uint8_t *buf, size_t size)
+{
+    if (!nvnet_proxy_enabled || size < 42) return 0;
+
+    uint16_t ethertype = (buf[12] << 8) | buf[13];
+    if (ethertype != 0x0800) return 0;
+
+    uint8_t protocol = buf[14 + 9];
+    if (protocol != 17) return 0;
+
+    /* Skip DHCP */
+    uint16_t dst_port = (buf[14 + 20 + 2] << 8) | buf[14 + 20 + 3];
+    if (dst_port == DHCP_SERVER_PORT) return 0;
+
+    uint16_t src_port = (buf[14 + 20] << 8) | buf[14 + 20 + 1];
+    uint32_t dst_ip;
+    memcpy(&dst_ip, buf + 14 + 16, 4);
+
+    size_t udp_len = ((buf[14 + 20 + 4] << 8) | buf[14 + 20 + 5]) - 8;
+    const uint8_t *payload = buf + 14 + 20 + 8;
+
+    int idx = find_or_create_udp_conn(src_port, dst_ip, dst_port);
+    if (idx < 0) return 0;
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = dst_ip;
+    addr.sin_port = htons(dst_port);
+
+    sendto(udp_conns[idx].socket_fd, payload, udp_len, 0,
+           (struct sockaddr *)&addr, sizeof(addr));
+
+    return 1;
+}
+
+/* ============================================================================
+ * TCP Proxy
+ * ============================================================================ */
+static int find_tcp_conn(uint16_t xbox_port, uint32_t remote_ip, uint16_t remote_port)
+{
+    for (int i = 0; i < MAX_TCP_CONNS; i++) {
+        if (tcp_conns[i].active &&
+            tcp_conns[i].xbox_port == xbox_port &&
+            tcp_conns[i].remote_ip == remote_ip &&
+            tcp_conns[i].remote_port == remote_port) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void send_tcp_to_xbox(NvNetState *s, int conn_idx, uint8_t flags,
+                              const uint8_t *payload, size_t payload_len)
+{
+    tcp_conn_t *conn = &tcp_conns[conn_idx];
+    uint8_t pkt[1514];
+    memset(pkt, 0, sizeof(pkt));
+
+    /* Ethernet */
+    memcpy(pkt, nvnet_xbox_mac, 6);
+    memcpy(pkt + 6, nvnet_host_mac, 6);
+    pkt[12] = 0x08; pkt[13] = 0x00;
+
+    /* IP */
+    uint8_t *ip = pkt + 14;
+    ip[0] = 0x45;
+    size_t ip_total = 20 + 20 + payload_len;
+    ip[2] = ip_total >> 8; ip[3] = ip_total & 0xFF;
+    ip[4] = rand(); ip[5] = rand();
+    ip[8] = 64;
+    ip[9] = 6; /* TCP */
+    memcpy(ip + 12, &conn->remote_ip, 4);
+    memcpy(ip + 16, &conn->xbox_ip, 4);
+
+    /* TCP */
+    uint8_t *tcp = ip + 20;
+    tcp[0] = conn->remote_port >> 8; tcp[1] = conn->remote_port & 0xFF;
+    tcp[2] = conn->xbox_port >> 8; tcp[3] = conn->xbox_port & 0xFF;
+    uint32_t seq_be = htonl(conn->seq_out);
+    uint32_t ack_be = htonl(conn->ack_out);
+    memcpy(tcp + 4, &seq_be, 4);
+    memcpy(tcp + 8, &ack_be, 4);
+    tcp[12] = 0x50; /* Data offset: 5 (20 bytes) */
+    tcp[13] = flags;
+    tcp[14] = 0xFF; tcp[15] = 0xFF; /* Window */
+
+    if (payload_len > 0) {
+        memcpy(tcp + 20, payload, payload_len);
+        conn->seq_out += payload_len;
+    }
+    if (flags & 0x02) conn->seq_out++; /* SYN */
+    if (flags & 0x01) conn->seq_out++; /* FIN */
+
+    /* Checksums */
+    uint16_t ip_ck = ip_checksum(ip, 20);
+    ip[10] = ip_ck >> 8; ip[11] = ip_ck & 0xFF;
+
+    uint32_t src_ip, dst_ip;
+    memcpy(&src_ip, ip + 12, 4);
+    memcpy(&dst_ip, ip + 16, 4);
+    uint16_t tcp_ck = tcp_udp_checksum(ntohl(src_ip), ntohl(dst_ip), 6, tcp, 20 + payload_len);
+    tcp[16] = tcp_ck >> 8; tcp[17] = tcp_ck & 0xFF;
+
+    dma_packet_to_guest(s, pkt, 14 + ip_total);
+}
+
+static int handle_tcp_packet(NvNetState *s, const uint8_t *buf, size_t size)
+{
+    if (!nvnet_proxy_enabled || size < 54) return 0;
+
+    uint16_t ethertype = (buf[12] << 8) | buf[13];
+    if (ethertype != 0x0800) return 0;
+
+    uint8_t protocol = buf[14 + 9];
+    if (protocol != 6) return 0;
+
+    uint8_t ihl = (buf[14] & 0x0F) * 4;
+    const uint8_t *tcp = buf + 14 + ihl;
+    uint16_t src_port = (tcp[0] << 8) | tcp[1];
+    uint16_t dst_port = (tcp[2] << 8) | tcp[3];
+    uint32_t seq = ntohl(*(uint32_t *)(tcp + 4));
+    uint8_t flags = tcp[13];
+    uint8_t tcp_hdr_len = ((tcp[12] >> 4) & 0x0F) * 4;
+
+    uint32_t dst_ip;
+    memcpy(&dst_ip, buf + 14 + 16, 4);
+
+    size_t payload_len = size - 14 - ihl - tcp_hdr_len;
+    const uint8_t *payload = tcp + tcp_hdr_len;
+
+    int idx = find_tcp_conn(src_port, dst_ip, dst_port);
+
+    if (flags & 0x02) { /* SYN */
+        nvnet_log("TCP SYN to %d.%d.%d.%d:%d from port %d",
+            dst_ip & 0xFF, (dst_ip >> 8) & 0xFF,
+            (dst_ip >> 16) & 0xFF, (dst_ip >> 24) & 0xFF,
+            dst_port, src_port);
+        if (idx >= 0) {
+            /* Reset existing */
+            close(tcp_conns[idx].socket_fd);
+            tcp_conns[idx].active = 0;
+        }
+        /* Find free slot */
+        for (int i = 0; i < MAX_TCP_CONNS; i++) {
+            if (!tcp_conns[i].active) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0) return 0;
+
+        int sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (sock < 0) return 0;
+
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = dst_ip;
+        addr.sin_port = htons(dst_port);
+
+        connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+        /* Will complete async */
+
+        pthread_mutex_lock(&proxy_mutex);
+        tcp_conns[idx].active = 1;
+        tcp_conns[idx].socket_fd = sock;
+        tcp_conns[idx].xbox_ip = nvnet_dhcp_client_ip;
+        tcp_conns[idx].xbox_port = src_port;
+        tcp_conns[idx].remote_ip = dst_ip;
+        tcp_conns[idx].remote_port = dst_port;
+        tcp_conns[idx].seq_out = rand();
+        tcp_conns[idx].ack_out = seq + 1;
+        tcp_conns[idx].seq_in = seq + 1;
+        tcp_conns[idx].state = 1; /* SYN_SENT */
+        pthread_mutex_unlock(&proxy_mutex);
+
+        /* Send SYN-ACK immediately (we'll manage the real connection async) */
+        send_tcp_to_xbox(s, idx, 0x12, NULL, 0); /* SYN+ACK */
+        return 1;
+    }
+
+    if (idx < 0) return 0;
+
+    tcp_conn_t *conn = &tcp_conns[idx];
+
+    if (flags & 0x10) { /* ACK */
+        if (conn->state == 1) {
+            conn->state = 2; /* ESTABLISHED */
+        }
+    }
+
+    if (payload_len > 0 && conn->state == 2) {
+        /* Send data to real server */
+        send(conn->socket_fd, payload, payload_len, MSG_NOSIGNAL);
+        conn->ack_out = seq + payload_len;
+        /* ACK the data */
+        send_tcp_to_xbox(s, idx, 0x10, NULL, 0);
+    }
+
+    if (flags & 0x01) { /* FIN */
+        conn->ack_out = seq + 1;
+        send_tcp_to_xbox(s, idx, 0x11, NULL, 0); /* FIN+ACK */
+        close(conn->socket_fd);
+        conn->active = 0;
+    }
+
+    return 1;
+}
+
+/* ============================================================================
+ * Inbound Connection Handler - For FTP and other incoming connections
+ * ============================================================================ */
+static void init_inbound_listeners(void)
+{
+    if (inbound_initialized) return;
+    inbound_initialized = 1;
+
+    memset(inbound_conns, 0, sizeof(inbound_conns));
+
+    /* Port mapping: {listen_port, xbox_port} - use 2121 on host for FTP (21 needs root) */
+    int port_map[][2] = {{2121, 21}, {0, 0}};
+
+    for (int p = 0; port_map[p][0] != 0; p++) {
+        int listen_port = port_map[p][0];
+        int xbox_port = port_map[p][1];
+
+        int sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (sock < 0) continue;
+
+        int opt = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(listen_port);
+
+        if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            nvnet_log("Inbound: Failed to bind port %d: %s", listen_port, strerror(errno));
+            close(sock);
+            continue;
+        }
+
+        if (listen(sock, 5) < 0) {
+            close(sock);
+            continue;
+        }
+
+        inbound_conns[p].listen_fd = sock;
+        inbound_conns[p].xbox_port = xbox_port;
+        inbound_conns[p].active = 1;
+        inbound_conns[p].state = 0;
+        nvnet_log("Inbound: Listening on port %d -> Xbox port %d", listen_port, xbox_port);
+    }
+}
+
+static void inject_tcp_syn_to_xbox(NvNetState *s, int idx)
+{
+    inbound_conn_t *conn = &inbound_conns[idx];
+    uint8_t pkt[74]; /* Ethernet + IP + TCP with options */
+    memset(pkt, 0, sizeof(pkt));
+
+    /* Ethernet header */
+    memcpy(pkt, nvnet_xbox_mac, 6);
+    memcpy(pkt + 6, nvnet_host_mac, 6);
+    pkt[12] = 0x08; pkt[13] = 0x00;
+
+    /* IP header */
+    uint8_t *ip = pkt + 14;
+    ip[0] = 0x45; /* IPv4, 20-byte header */
+    ip[2] = 0; ip[3] = 44; /* Total length: 20 + 24 (TCP with options) */
+    ip[4] = rand(); ip[5] = rand(); /* ID */
+    ip[8] = 64; /* TTL */
+    ip[9] = 6; /* TCP */
+    memcpy(ip + 12, &conn->client_ip, 4); /* Source: real client */
+    memcpy(ip + 16, &nvnet_dhcp_client_ip, 4); /* Dest: Xbox */
+
+    /* IP checksum */
+    uint16_t ip_ck = ip_checksum(ip, 20);
+    ip[10] = ip_ck >> 8; ip[11] = ip_ck & 0xFF;
+
+    /* TCP header */
+    uint8_t *tcp = ip + 20;
+    tcp[0] = conn->client_port >> 8; tcp[1] = conn->client_port & 0xFF;
+    tcp[2] = conn->xbox_port >> 8; tcp[3] = conn->xbox_port & 0xFF;
+    conn->seq_to_xbox = rand();
+    uint32_t seq_be = htonl(conn->seq_to_xbox);
+    memcpy(tcp + 4, &seq_be, 4); /* Seq */
+    tcp[12] = 0x60; /* Data offset: 6 (24 bytes with options) */
+    tcp[13] = 0x02; /* SYN */
+    tcp[14] = 0xFF; tcp[15] = 0xFF; /* Window */
+    /* MSS option */
+    tcp[20] = 2; tcp[21] = 4; tcp[22] = 0x05; tcp[23] = 0xB4; /* MSS 1460 */
+
+    /* TCP checksum */
+    uint16_t tcp_ck = tcp_udp_checksum(ntohl(conn->client_ip),
+                                        ntohl(nvnet_dhcp_client_ip),
+                                        6, tcp, 24);
+    tcp[16] = tcp_ck >> 8; tcp[17] = tcp_ck & 0xFF;
+
+    nvnet_log("Inbound: Injecting SYN to Xbox port %d from %08x:%d",
+              conn->xbox_port, ntohl(conn->client_ip), conn->client_port);
+
+    dma_packet_to_guest(s, pkt, 14 + 20 + 24);
+    conn->state = 1; /* SYN sent to Xbox */
+    conn->seq_to_xbox++; /* SYN consumes one seq */
+}
+
+static void poll_inbound_connections(NvNetState *s)
+{
+    if (!inbound_initialized) {
+        init_inbound_listeners();
+    }
+
+    for (int i = 0; i < MAX_INBOUND_CONNS; i++) {
+        if (!inbound_conns[i].active) continue;
+
+        inbound_conn_t *conn = &inbound_conns[i];
+
+        if (conn->state == 0 && conn->listen_fd > 0) {
+            /* Check for new connections */
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int client_fd = accept(conn->listen_fd, (struct sockaddr *)&client_addr, &client_len);
+            if (client_fd > 0) {
+                /* Set non-blocking */
+                int flags = fcntl(client_fd, F_GETFL, 0);
+                fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+
+                conn->client_fd = client_fd;
+                conn->client_ip = client_addr.sin_addr.s_addr;
+                conn->client_port = ntohs(client_addr.sin_port);
+
+                nvnet_log("Inbound: New connection on port %d from %08x:%d",
+                          conn->xbox_port, ntohl(conn->client_ip), conn->client_port);
+
+                /* Inject SYN to Xbox */
+                inject_tcp_syn_to_xbox(s, i);
+            }
+        } else if (conn->state == 2 && conn->client_fd > 0) {
+            /* Established - read data from client and inject to Xbox */
+            uint8_t buf[1400];
+            ssize_t n = recv(conn->client_fd, buf, sizeof(buf), MSG_DONTWAIT);
+            if (n > 0) {
+                /* Build TCP packet with data and inject to Xbox */
+                uint8_t pkt[1514];
+                memset(pkt, 0, sizeof(pkt));
+
+                memcpy(pkt, nvnet_xbox_mac, 6);
+                memcpy(pkt + 6, nvnet_host_mac, 6);
+                pkt[12] = 0x08; pkt[13] = 0x00;
+
+                uint8_t *ip = pkt + 14;
+                ip[0] = 0x45;
+                size_t ip_len = 20 + 20 + n;
+                ip[2] = ip_len >> 8; ip[3] = ip_len & 0xFF;
+                ip[8] = 64; ip[9] = 6;
+                memcpy(ip + 12, &conn->client_ip, 4);
+                memcpy(ip + 16, &nvnet_dhcp_client_ip, 4);
+
+                uint16_t ip_ck = ip_checksum(ip, 20);
+                ip[10] = ip_ck >> 8; ip[11] = ip_ck & 0xFF;
+
+                uint8_t *tcp = ip + 20;
+                tcp[0] = conn->client_port >> 8; tcp[1] = conn->client_port & 0xFF;
+                tcp[2] = conn->xbox_port >> 8; tcp[3] = conn->xbox_port & 0xFF;
+                uint32_t seq_be = htonl(conn->seq_to_xbox);
+                memcpy(tcp + 4, &seq_be, 4);
+                tcp[12] = 0x50; /* 20 byte header */
+                tcp[13] = 0x18; /* PSH+ACK */
+                tcp[14] = 0xFF; tcp[15] = 0xFF;
+
+                memcpy(tcp + 20, buf, n);
+                conn->seq_to_xbox += n;
+
+                uint16_t tcp_ck = tcp_udp_checksum(ntohl(conn->client_ip),
+                                                    ntohl(nvnet_dhcp_client_ip),
+                                                    6, tcp, 20 + n);
+                tcp[16] = tcp_ck >> 8; tcp[17] = tcp_ck & 0xFF;
+
+                dma_packet_to_guest(s, pkt, 14 + ip_len);
+            } else if (n == 0) {
+                /* Client disconnected */
+                close(conn->client_fd);
+                conn->client_fd = 0;
+                conn->state = 0;
+                nvnet_log("Inbound: Client disconnected from port %d", conn->xbox_port);
+            }
+        }
+    }
+}
+
+/* Handle outgoing packets from Xbox that are responses to inbound connections */
+static int handle_inbound_tcp_response(NvNetState *s, const uint8_t *buf, size_t size)
+{
+    if (size < 54) return 0;
+
+    uint16_t ethertype = (buf[12] << 8) | buf[13];
+    if (ethertype != 0x0800) return 0;
+
+    uint8_t protocol = buf[14 + 9];
+    if (protocol != 6) return 0;
+
+    uint8_t ihl = (buf[14] & 0x0F) * 4;
+    const uint8_t *tcp = buf + 14 + ihl;
+    uint16_t src_port = (tcp[0] << 8) | tcp[1];
+    uint16_t dst_port = (tcp[2] << 8) | tcp[3];
+    uint8_t flags = tcp[13];
+    uint8_t tcp_hdr_len = ((tcp[12] >> 4) & 0x0F) * 4;
+
+    uint32_t dst_ip;
+    memcpy(&dst_ip, buf + 14 + 16, 4);
+
+    /* Check if this is a response to an inbound connection */
+    for (int i = 0; i < MAX_INBOUND_CONNS; i++) {
+        inbound_conn_t *conn = &inbound_conns[i];
+        if (!conn->active || conn->client_fd <= 0) continue;
+        if (src_port != conn->xbox_port) continue;
+        if (dst_port != conn->client_port) continue;
+        if (dst_ip != conn->client_ip) continue;
+
+        /* This is a response to our inbound connection */
+        if ((flags & 0x12) == 0x12 && conn->state == 1) { /* SYN+ACK and waiting */
+            conn->state = 2; /* Established */
+            uint32_t xbox_seq = ntohl(*(uint32_t *)(tcp + 4));
+            uint32_t xbox_ack = ntohl(*(uint32_t *)(tcp + 8));
+            conn->seq_to_client = xbox_seq + 1; /* Next expected from Xbox */
+            conn->seq_to_xbox = xbox_ack; /* Our next seq to Xbox */
+            nvnet_log("Inbound: Got SYN-ACK from Xbox, sending ACK");
+
+            /* Send ACK to Xbox to complete handshake */
+            uint8_t ack_pkt[54];
+            memset(ack_pkt, 0, sizeof(ack_pkt));
+            /* Ethernet */
+            memcpy(ack_pkt, nvnet_xbox_mac, 6);
+            memcpy(ack_pkt + 6, nvnet_host_mac, 6);
+            ack_pkt[12] = 0x08; ack_pkt[13] = 0x00;
+            /* IP header */
+            ack_pkt[14] = 0x45;
+            ack_pkt[16] = 0; ack_pkt[17] = 40; /* Total length */
+            ack_pkt[22] = 64; /* TTL */
+            ack_pkt[23] = 6; /* TCP */
+            memcpy(ack_pkt + 26, &conn->client_ip, 4); /* Src IP */
+            memcpy(ack_pkt + 30, &nvnet_dhcp_client_ip, 4); /* Dst IP (Xbox) */
+            /* TCP header */
+            uint8_t *ack_tcp = ack_pkt + 34;
+            ack_tcp[0] = conn->client_port >> 8; ack_tcp[1] = conn->client_port & 0xFF;
+            ack_tcp[2] = conn->xbox_port >> 8; ack_tcp[3] = conn->xbox_port & 0xFF;
+            uint32_t seq_n = htonl(conn->seq_to_xbox);
+            uint32_t ack_n = htonl(conn->seq_to_client);
+            memcpy(ack_tcp + 4, &seq_n, 4);
+            memcpy(ack_tcp + 8, &ack_n, 4);
+            ack_tcp[12] = 0x50; /* 5 words */
+            ack_tcp[13] = 0x10; /* ACK flag */
+            ack_tcp[14] = 0xFF; ack_tcp[15] = 0xFF; /* Window */
+            /* Checksums */
+            uint32_t ip_sum = 0;
+            for (int j = 14; j < 34; j += 2) ip_sum += (ack_pkt[j] << 8) | ack_pkt[j+1];
+            while (ip_sum >> 16) ip_sum = (ip_sum & 0xFFFF) + (ip_sum >> 16);
+            ack_pkt[24] = (~ip_sum >> 8) & 0xFF; ack_pkt[25] = ~ip_sum & 0xFF;
+            dma_packet_to_guest(s, ack_pkt, 54);
+        }
+
+        if (flags & 0x10) { /* ACK or data */
+            size_t payload_len = size - 14 - ihl - tcp_hdr_len;
+            if (payload_len > 0) {
+                /* Forward data to real client */
+                const uint8_t *payload = tcp + tcp_hdr_len;
+                send(conn->client_fd, payload, payload_len, MSG_NOSIGNAL);
+                nvnet_log("Inbound: Forwarded %zu bytes to client", payload_len);
+            }
+        }
+
+        if (flags & 0x01) { /* FIN */
+            close(conn->client_fd);
+            conn->client_fd = 0;
+            conn->state = 0;
+            nvnet_log("Inbound: Xbox closed connection");
+        }
+
+        return 1; /* Handled */
+    }
+
+    return 0;
+}
+
+/* ============================================================================
+ * Synchronous RX Poll - Called from main thread during TX
+ * ============================================================================ */
+static void proxy_poll_rx(NvNetState *s)
+{
+    uint8_t rxbuf[2048];
+
+    /* Poll inbound connections (FTP, etc.) */
+    poll_inbound_connections(s);
+
+    /* Poll UDP sockets */
+    for (int i = 0; i < MAX_UDP_CONNS; i++) {
+        if (!udp_conns[i].active) continue;
+
+        struct sockaddr_in from;
+        socklen_t fromlen = sizeof(from);
+        ssize_t n = recvfrom(udp_conns[i].socket_fd, rxbuf, sizeof(rxbuf), MSG_DONTWAIT,
+                              (struct sockaddr *)&from, &fromlen);
+        if (n > 0) {
+            nvnet_log("UDP RX: %zd bytes from conn %d", n, i);
+
+            /* Build UDP packet to Xbox */
+            uint8_t pkt[1514];
+            memset(pkt, 0, sizeof(pkt));
+
+            memcpy(pkt, nvnet_xbox_mac, 6);
+            memcpy(pkt + 6, nvnet_host_mac, 6);
+            pkt[12] = 0x08; pkt[13] = 0x00;
+
+            uint8_t *ip = pkt + 14;
+            ip[0] = 0x45;
+            size_t ip_len = 20 + 8 + n;
+            ip[2] = ip_len >> 8; ip[3] = ip_len & 0xFF;
+            ip[8] = 64; ip[9] = 17;
+            memcpy(ip + 12, &udp_conns[i].remote_ip, 4);
+            memcpy(ip + 16, &udp_conns[i].xbox_ip, 4);
+
+            uint8_t *udp = ip + 20;
+            udp[0] = udp_conns[i].remote_port >> 8;
+            udp[1] = udp_conns[i].remote_port & 0xFF;
+            udp[2] = udp_conns[i].xbox_port >> 8;
+            udp[3] = udp_conns[i].xbox_port & 0xFF;
+            size_t udp_len = 8 + n;
+            udp[4] = udp_len >> 8; udp[5] = udp_len & 0xFF;
+
+            memcpy(udp + 8, rxbuf, n);
+
+            uint16_t ip_ck = ip_checksum(ip, 20);
+            ip[10] = ip_ck >> 8; ip[11] = ip_ck & 0xFF;
+
+            dma_packet_to_guest(s, pkt, 14 + ip_len);
+        }
+    }
+
+    /* Poll TCP sockets */
+    for (int i = 0; i < MAX_TCP_CONNS; i++) {
+        if (!tcp_conns[i].active || tcp_conns[i].state != 2) continue;
+
+        ssize_t n = recv(tcp_conns[i].socket_fd, rxbuf, 1400, MSG_DONTWAIT);
+        if (n > 0) {
+            nvnet_log("TCP RX: %zd bytes from conn %d", n, i);
+            send_tcp_to_xbox(s, i, 0x18, rxbuf, n); /* PSH+ACK */
+        } else if (n == 0) {
+            /* Connection closed */
+            send_tcp_to_xbox(s, i, 0x11, NULL, 0); /* FIN+ACK */
+            close(tcp_conns[i].socket_fd);
+            tcp_conns[i].active = 0;
+        }
+    }
+}
+
+/* ============================================================================
+ * Main packet handler - intercepts all traffic
+ * ============================================================================ */
 static void send_packet(NvNetState *s, const uint8_t *buf, size_t size)
 {
-    NetClientState *nc = qemu_get_queue(s->nic);
+    static int pkt_count = 0;
+    pkt_count++;
 
-    trace_nvnet_packet_tx(size);
-    qemu_send_packet(nc, buf, size);
+    /* Log every packet from Xbox */
+    uint16_t ethertype = (size >= 14) ? ((buf[12] << 8) | buf[13]) : 0;
+    nvnet_log("send_packet #%d: size=%zu ethertype=0x%04x proxy_enabled=%d",
+              pkt_count, size, ethertype, nvnet_proxy_enabled);
+
+    /* Poll for any pending RX data (synchronous, no threading) */
+    if (nvnet_proxy_enabled) {
+        proxy_poll_rx(s);
+    }
+
+    /* Try proxy handlers in order */
+    if (handle_arp_packet(s, buf, size)) {
+        nvnet_log("Packet handled by ARP handler");
+        return;
+    }
+    if (handle_dhcp_packet(s, buf, size)) {
+        nvnet_log("Packet handled by DHCP handler");
+        return;
+    }
+    /* Check for inbound connection responses before normal TCP */
+    if (handle_inbound_tcp_response(s, buf, size)) {
+        nvnet_log("Packet handled by inbound TCP handler");
+        return;
+    }
+    if (handle_udp_packet(s, buf, size)) {
+        nvnet_log("Packet handled by UDP handler");
+        return;
+    }
+    if (handle_tcp_packet(s, buf, size)) {
+        nvnet_log("Packet handled by TCP handler");
+        return;
+    }
+
+    /* If proxy not enabled or unhandled, send to network normally */
+    if (!nvnet_proxy_enabled) {
+        nvnet_log("Proxy not enabled, sending to QEMU network backend");
+        NetClientState *nc = qemu_get_queue(s->nic);
+        trace_nvnet_packet_tx(size);
+        qemu_send_packet(nc, buf, size);
+    } else {
+        nvnet_log("Packet not handled by any proxy handler");
+    }
 }
 
 static uint16_t get_tx_ring_size(NvNetState *s)
@@ -395,6 +1423,9 @@ static bool nvnet_can_receive(NetClientState *nc)
     return can_rx;
 }
 
+/* Mutex for thread-safe packet injection */
+static pthread_mutex_t dma_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static ssize_t dma_packet_to_guest(NvNetState *s, const uint8_t *buf,
                                    size_t size)
 {
@@ -402,7 +1433,15 @@ static ssize_t dma_packet_to_guest(NvNetState *s, const uint8_t *buf,
     NetClientState *nc = qemu_get_queue(s->nic);
     ssize_t rval;
 
+    uint16_t ethertype = (size >= 14) ? ((buf[12] << 8) | buf[13]) : 0;
+    nvnet_log("dma_packet_to_guest: size=%zu ethertype=0x%04x", size, ethertype);
+
+    /* Thread-safe: lock before accessing NvNetState */
+    pthread_mutex_lock(&dma_mutex);
+
     if (!nvnet_can_receive(nc)) {
+        nvnet_log("dma_packet_to_guest: nvnet_can_receive returned false!");
+        pthread_mutex_unlock(&dma_mutex);
         return -1;
     }
 
@@ -439,6 +1478,7 @@ static ssize_t dma_packet_to_guest(NvNetState *s, const uint8_t *buf,
 
     set_dma_idle(s, true);
 
+    pthread_mutex_unlock(&dma_mutex);
     return rval;
 }
 
@@ -691,6 +1731,16 @@ static void autoneg_timer(void *opaque)
     }
 }
 
+static void proxy_poll_timer_cb(void *opaque)
+{
+    NvNetState *s = opaque;
+    if (nvnet_proxy_enabled) {
+        proxy_poll_rx(s);
+        /* Re-arm timer for next poll (every 20ms) */
+        timer_mod(s->proxy_poll_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 20);
+    }
+}
+
 static bool have_autoneg(NvNetState *s)
 {
     return (s->phy_regs[MII_BMCR] & MII_BMCR_AUTOEN);
@@ -921,6 +1971,7 @@ static void nvnet_realize(PCIDevice *pci_dev, Error **errp)
                           &dev->mem_reentrancy_guard, s);
 
     s->autoneg_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, autoneg_timer, s);
+    s->proxy_poll_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, proxy_poll_timer_cb, s);
 }
 
 static void nvnet_uninit(PCIDevice *dev)
@@ -928,6 +1979,7 @@ static void nvnet_uninit(PCIDevice *dev)
     NvNetState *s = NVNET(dev);
     qemu_del_nic(s->nic);
     timer_free(s->autoneg_timer);
+    timer_free(s->proxy_poll_timer);
 }
 
 // clang-format off

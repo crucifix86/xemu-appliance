@@ -235,10 +235,14 @@ net:
   enable: bool
   backend:
     type: enum
-    values: [nat, udp, pcap]
+    values: [nat, udp, pcap, tap]
     default: nat
   pcap:
     netif: string
+  tap:
+    ifname:
+      type: string
+      default: tap0
   udp:
     bind_addr:
       type: string

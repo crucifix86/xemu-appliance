@@ -806,91 +806,96 @@ void MainMenuNetworkView::Draw()
         const char *current_ssid = xemu_wifi_get_current_ssid();
 
         if (connected && current_ssid) {
+            /* Connected state - show only status and disconnect */
             char status_buf[128];
             snprintf(status_buf, sizeof(status_buf), "Connected to: %s", current_ssid);
             ImGui::TextUnformatted(status_buf);
+            ImGui::Spacing();
 
             if (ImGui::Button("Disconnect")) {
                 xemu_wifi_disconnect();
             }
-        } else {
-            ImGui::TextUnformatted("Not connected");
-        }
 
-        ImGui::Spacing();
-
-        /* Scan button */
-        if (ImGui::Button(wifi_scanning ? "Scanning..." : "Scan for Networks")) {
-            wifi_scanning = true;
-            xemu_wifi_scan();
-            wifi_scanning = false;
-            selected_network = -1;
-        }
-
-        /* Network list */
-        int count = xemu_wifi_get_count();
-        if (count > 0) {
-            ImGui::Spacing();
-            ImGui::TextUnformatted("Available Networks:");
-
-            for (int i = 0; i < count && i < 10; i++) {
-                const xemu_wifi_network_t *net = xemu_wifi_get_network(i);
-                if (!net) continue;
-
-                ImGui::PushID(i);
-
-                /* Signal strength indicator */
-                char label[128];
-                const char *lock = net->encrypted ? " [*]" : "";
-                const char *conn = net->connected ? " (connected)" : "";
-                snprintf(label, sizeof(label), "%s%s%s - %d%%",
-                         net->ssid, lock, conn, net->signal_strength);
-
-                if (ImGui::Selectable(label, selected_network == i)) {
-                    selected_network = i;
-                    if (net->encrypted && !net->connected) {
-                        show_password_input = true;
-                        strncpy(connecting_ssid, net->ssid, sizeof(connecting_ssid) - 1);
-                        wifi_password[0] = '\0';
-                    } else if (!net->connected) {
-                        /* Open network - connect directly */
-                        xemu_wifi_connect(net->ssid, NULL);
-                    }
-                }
-
-                ImGui::PopID();
-            }
-        }
-
-        /* Password input dialog */
-        if (show_password_input) {
             ImGui::Spacing();
             ImGui::Separator();
-            char pwd_label[128];
-            snprintf(pwd_label, sizeof(pwd_label), "Password for %s:", connecting_ssid);
-            ImGui::TextUnformatted(pwd_label);
+            ImGui::Spacing();
+        } else {
+            /* Not connected - show scan and network list */
+            ImGui::TextUnformatted("Not connected");
+            ImGui::Spacing();
 
-            ImGui::PushItemWidth(200);
-            ImGui::InputText("###wifi_pwd", wifi_password, sizeof(wifi_password),
-                             ImGuiInputTextFlags_Password);
-            ImGui::PopItemWidth();
+            /* Scan button */
+            if (ImGui::Button(wifi_scanning ? "Scanning..." : "Scan for Networks")) {
+                wifi_scanning = true;
+                xemu_wifi_scan();
+                wifi_scanning = false;
+                selected_network = -1;
+            }
 
-            ImGui::SameLine();
-            if (ImGui::Button("Connect")) {
-                xemu_wifi_connect(connecting_ssid, wifi_password);
-                show_password_input = false;
-                wifi_password[0] = '\0';
+            /* Network list */
+            int count = xemu_wifi_get_count();
+            if (count > 0) {
+                ImGui::Spacing();
+                ImGui::TextUnformatted("Available Networks:");
+
+                for (int i = 0; i < count && i < 10; i++) {
+                    const xemu_wifi_network_t *net = xemu_wifi_get_network(i);
+                    if (!net) continue;
+
+                    ImGui::PushID(i);
+
+                    /* Signal strength indicator */
+                    char label[128];
+                    const char *lock = net->encrypted ? " [*]" : "";
+                    snprintf(label, sizeof(label), "%s%s - %d%%",
+                             net->ssid, lock, net->signal_strength);
+
+                    if (ImGui::Selectable(label, selected_network == i)) {
+                        selected_network = i;
+                        if (net->encrypted) {
+                            show_password_input = true;
+                            strncpy(connecting_ssid, net->ssid, sizeof(connecting_ssid) - 1);
+                            wifi_password[0] = '\0';
+                        } else {
+                            /* Open network - connect directly */
+                            xemu_wifi_connect(net->ssid, NULL);
+                        }
+                    }
+
+                    ImGui::PopID();
+                }
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel")) {
-                show_password_input = false;
-                wifi_password[0] = '\0';
+
+            /* Password input dialog */
+            if (show_password_input) {
+                ImGui::Spacing();
+                ImGui::Separator();
+                char pwd_label[128];
+                snprintf(pwd_label, sizeof(pwd_label), "Password for %s:", connecting_ssid);
+                ImGui::TextUnformatted(pwd_label);
+
+                ImGui::PushItemWidth(200);
+                ImGui::InputText("###wifi_pwd", wifi_password, sizeof(wifi_password),
+                                 ImGuiInputTextFlags_Password);
+                ImGui::PopItemWidth();
+
+                ImGui::SameLine();
+                if (ImGui::Button("Connect")) {
+                    xemu_wifi_connect(connecting_ssid, wifi_password);
+                    show_password_input = false;
+                    wifi_password[0] = '\0';
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel")) {
+                    show_password_input = false;
+                    wifi_password[0] = '\0';
+                }
             }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
         }
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
     }
 #endif
 
@@ -914,7 +919,8 @@ void MainMenuNetworkView::Draw()
             "Attached to", &g_config.net.backend,
             "NAT\0"
             "UDP Tunnel\0"
-            "Bridged Adapter\0",
+            "Bridged Adapter\0"
+            "TAP Device\0",
             "Controls what the virtual network controller interfaces with")) {
         appearing = true;
     }
@@ -928,6 +934,9 @@ void MainMenuNetworkView::Draw()
         break;
     case CONFIG_NET_BACKEND_UDP:
         DrawUdpOptions(appearing);
+        break;
+    case CONFIG_NET_BACKEND_TAP:
+        DrawTapOptions(appearing);
         break;
     default: break;
     }
@@ -1093,6 +1102,26 @@ void MainMenuNetworkView::DrawUdpOptions(bool appearing)
     ImGui::SetNextItemWidth(width);
     if (ImGui::InputText("###local_host", local_addr, sizeof(local_addr))) {
         xemu_settings_set_string(&g_config.net.udp.bind_addr, local_addr);
+    }
+    ImGui::PopFont();
+}
+
+void MainMenuNetworkView::DrawTapOptions(bool appearing)
+{
+    if (appearing) {
+        strncpy(tap_ifname, g_config.net.tap.ifname, sizeof(tap_ifname) - 1);
+    }
+
+    float size_ratio = 0.5;
+    float width = ImGui::GetColumnWidth() * size_ratio;
+    ImGui::PushFont(g_font_mgr.m_menu_font_small);
+    PrepareComboTitleDescription(
+        "TAP Interface",
+        "TAP device name to use (e.g. tap0)",
+        size_ratio);
+    ImGui::SetNextItemWidth(width);
+    if (ImGui::InputText("###tap_ifname", tap_ifname, sizeof(tap_ifname))) {
+        xemu_settings_set_string(&g_config.net.tap.ifname, tap_ifname);
     }
     ImGui::PopFont();
 }
