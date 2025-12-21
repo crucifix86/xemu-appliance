@@ -8,3 +8,8 @@ rootfs/
 # Build artifacts
 /mnt/
 *.log
+
+# xemu build artifacts
+xemu-source/build/
+xemu-source/dist/
+xemu-source/subprojects/packagecache/

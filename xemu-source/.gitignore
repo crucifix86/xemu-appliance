@@ -1,0 +1,5 @@
+build/
+dist/
+*.o
+*.log
+tests/keys/id_rsa
