@@ -40,6 +40,10 @@
 #include "../xemu-os-utils.h"
 #include "../xemu-xbe.h"
 
+#ifdef __linux__
+#include "../xemu-alsa-mixer.h"
+#endif
+
 #include "../thirdparty/fatx/fatx.h"
 
 #define DEFAULT_XMU_SIZE 8388608
@@ -604,10 +608,59 @@ void MainMenuDisplayView::Draw()
 void MainMenuAudioView::Draw()
 {
     SectionTitle("Volume");
-    char buf[32];
+    char buf[128];
     snprintf(buf, sizeof(buf), "Limit output volume (%d%%)",
              (int)(g_config.audio.volume_limit * 100));
     Slider("Output volume limit", &g_config.audio.volume_limit, buf);
+
+#ifdef __linux__
+    /* ALSA Mixer Controls */
+    static bool mixer_init_attempted = false;
+    static bool mixer_available = false;
+
+    if (!mixer_init_attempted) {
+        mixer_init_attempted = true;
+        mixer_available = (xemu_mixer_init() == 0);
+    }
+
+    if (mixer_available) {
+        xemu_mixer_refresh();
+        int count = xemu_mixer_get_count();
+
+        if (count > 0) {
+            SectionTitle("System Mixer");
+
+            for (int i = 0; i < count; i++) {
+                const char *name = xemu_mixer_get_name(i);
+                if (!name) continue;
+
+                int vol = xemu_mixer_get_volume(i);
+                float vol_f = vol / 100.0f;
+
+                snprintf(buf, sizeof(buf), "%s (%d%%)", name, vol);
+
+                ImGui::PushID(i);
+                Slider(name, &vol_f, buf);
+
+                int new_vol = (int)(vol_f * 100);
+                if (new_vol != vol) {
+                    xemu_mixer_set_volume(i, new_vol);
+                }
+
+                /* Show mute toggle if available */
+                if (xemu_mixer_has_switch(i)) {
+                    bool unmuted = xemu_mixer_get_switch(i);
+                    char toggle_id[64];
+                    snprintf(toggle_id, sizeof(toggle_id), "%s Unmute", name);
+                    if (Toggle(toggle_id, &unmuted, "Enable audio output")) {
+                        xemu_mixer_set_switch(i, unmuted);
+                    }
+                }
+                ImGui::PopID();
+            }
+        }
+    }
+#endif
 
     SectionTitle("Quality");
     Toggle("Real-time DSP processing", &g_config.audio.use_dsp,
